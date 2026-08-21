@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>example_cs_winui3</AssemblyName>
+    <RootNamespace>SensorSdk.ExampleWinUI3</RootNamespace>
+    <UseWinUI>true</UseWinUI>
+    <!-- Unpackaged + self-contained: runs straight from the output dir, no
+         MSIX install and no system-wide Windows App Runtime dependency. -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <!-- SDK library selection: the VS platform dropdown picks x64/x86 and the
+         configuration dropdown picks the Debug/Release sensor.dll -->
+    <Platforms>x64;x86</Platforms>
+    <Platform Condition="'$(Platform)'==''">x64</Platform>
+    <SensorSdkArch Condition="'$(Platform)'=='x86'">x86</SensorSdkArch>
+    <SensorSdkArch Condition="'$(SensorSdkArch)'==''">x64</SensorSdkArch>
+    <SensorSdkConfig Condition="'$(SensorSdkConfig)'==''">Release</SensorSdkConfig>
+    <SensorSdkLibArch Condition="'$(SensorSdkArch)'=='x86'">Win32</SensorSdkLibArch>
+    <SensorSdkLibArch Condition="'$(SensorSdkLibArch)'==''">$(SensorSdkArch)</SensorSdkLibArch>
+    <!-- the 32-bit SDK build is named sensor32.dll; copied as sensor.dll -->
+    <SensorSdkDllName Condition="'$(SensorSdkArch)'=='x86'">sensor32.dll</SensorSdkDllName>
+    <SensorSdkDllName Condition="'$(SensorSdkDllName)'==''">sensor.dll</SensorSdkDllName>
+    <RuntimeIdentifier>win-$(SensorSdkArch)</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.4.0" />
+    <PackageReference Include="Microsoft.Graphics.Win2D" Version="1.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- C# bindings over the sen_* flat C API (compiled into this app) -->
+    <Compile Include="..\bindings\csharp\SensorCapi.cs" Link="SensorCapi.cs" />
+    <Compile Include="..\bindings\csharp\Sensor.cs" Link="Sensor.cs" />
+  </ItemGroup>
+
+  <!-- Prebuilt SDK shared library; copied next to the exe after build -->
+  <ItemGroup>
+    <None Include="..\lib\windows\$(SensorSdkLibArch)\$(SensorSdkConfig)\$(SensorSdkDllName)">
+      <Link>sensor.dll</Link>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <Target Name="CheckSensorSdkDll" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(MSBuildProjectDirectory)\..\lib\windows\$(SensorSdkLibArch)\$(SensorSdkConfig)\$(SensorSdkDllName)')"
+           Text="$(SensorSdkDllName) not found: lib\windows\$(SensorSdkLibArch)\$(SensorSdkConfig)\$(SensorSdkDllName) -- build it first (python bld/windows/build_windows.py --release --archs x86,x64)" />
+  </Target>
+
+</Project>
