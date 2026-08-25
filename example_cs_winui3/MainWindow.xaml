@@ -43,13 +43,21 @@
 
             <!-- Device page -->
             <StackPanel Grid.Row="0" Spacing="4">
-                <StackPanel Orientation="Horizontal" Spacing="12">
-                    <CheckBox x:Name="AutoReconnectBox" Content="Auto Reconnect" IsChecked="True"
-                              Click="OnAutoReconnectToggled"/>
-                    <TextBlock Text="Discovered Devices:" VerticalAlignment="Center"/>
-                    <CheckBox x:Name="CloneDataBox" Content="Clone Data"/>
-                    <TextBlock x:Name="SdkLabel" VerticalAlignment="Center"/>
-                </StackPanel>
+                <Grid>
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <CheckBox x:Name="AutoReconnectBox" Content="Auto Reconnect" IsChecked="True"
+                                  Click="OnAutoReconnectToggled"/>
+                        <TextBlock Text="Discovered Devices:" VerticalAlignment="Center"/>
+                        <CheckBox x:Name="CloneDataBox" Content="Clone Data"/>
+                        <TextBlock x:Name="SdkLabel" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                        <Button x:Name="MultiSyncButton" Content="Multi Start" Click="OnMultiSyncClicked"
+                                IsEnabled="False" MinWidth="110"/>
+                        <Button x:Name="MultiReplayButton" Content="Multi Replay Bin" Click="OnMultiReplayClicked"
+                                MinWidth="110"/>
+                    </StackPanel>
+                </Grid>
 
                 <Grid ColumnDefinitions="Auto,*,Auto">
                     <StackPanel Grid.Column="0" Spacing="4">

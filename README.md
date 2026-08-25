@@ -272,14 +272,16 @@ disconnected device again (back in `Ready`, about to resume), this delegate
 is invoked instead of the default flow:
 
 ```csharp
-sensorProfile.OnAutoReconnect = (SensorProfile sensor, bool hasLastSession) =>
+sensorProfile.OnAutoReconnect = (SensorProfile sensor, bool hasLastSession, Action<bool> answer) =>
 {
     // hasLastSession=true  -> a previous session exists (init args + setParam
     //                         values can be preserved and restored)
-    // return true  -> the app handled recovery itself; the SDK skips the
-    //                 default recovery
-    // return false -> fall back to the default flow
-    return false;
+    // answer(true)  -> the app handled recovery itself; the SDK skips the
+    //                  default recovery
+    // answer(false) -> fall back to the default flow
+    // Answer exactly once, from any thread; if no answer arrives within 10 s
+    // the SDK runs the default recovery.
+    answer(false);
 };
 ```
 
@@ -557,6 +559,27 @@ result = controller.StopBinReplay(deviceMac);
 // Each returns "OK" on success or an error string otherwise.
 ```
 
+### Synchronized multi-bin replay
+
+Replays several captures concurrently on one shared clock aligned by their
+recorded timestamps: the earliest record in the group is t=0, so captures
+recorded at the same time keep their original relative offsets (a capture
+whose data starts 45 s later delivers its first packet 45 s into the
+replay). Pausing/resuming any member freezes/resumes the whole group;
+stopping stays per device:
+
+```csharp
+SensorProfile?[] replays = controller.MultiReplayBinFile(
+    new[] { "d:/temp/dev1.bin", "d:/temp/dev2.bin" },
+    new[] { "AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02" });
+// Input-order aligned; a null entry marks a member that failed
+// (bad/duplicate mac, mac busy, unreadable file).
+```
+
+Each started profile delivers data through the same callbacks as a single
+replay. In the demo UI, pick multiple `.bin` files in the file picker to
+start a group replay; picking a single file keeps the classic behavior.
+
 ### Parse a bin file to CSV
 
 Offline full-speed conversion through the real parsing pipeline; blocks the
@@ -627,7 +650,12 @@ Entries are tagged `[App]` in the log files. Never throws.
   labels and setParam controls are shown. Disconnect affects only the
   selected device. **Auto Reconnect** and **Clone Data** (safe deep-copy vs
   zero-copy batch queueing; default off = zero-copy) checkboxes sit above
-  the list.
+  the list. With Auto Reconnect on, recovery is app-driven: the
+  `OnAutoReconnect` query is answered with `true`, and once the link is
+  back the demo re-runs the connect/init/stream chain and re-applies the
+  recorded setParam history (results starting with "Error" are not
+  recorded); every disconnect tears the device UI state down
+  unconditionally.
 - **Left column**: 3D quaternion cube, 2D waveform of the selected type
   (ACC / GYRO / Quat / Euler) with per-channel labels, an FFT spectrum strip
   (recomputed every 500 ms on a worker thread), and a real-time values box.
@@ -646,10 +674,17 @@ Entries are tagged `[App]` in the log files. Never throws.
   timestamped subdir of `Documents/sensorsdklog`), Data Notification
   switches (EEG/EMG/GESTURE/PPG/SpO2/IMU, capability-gated by the device
   info), Filter switches (50Hz/60Hz/HPF/LPF), EEG Sample Rate radios
-  (250/500 Hz).
+  (250/500/1000/2000 Hz, capability-gated by `EEG_SAMPLE_RATE_LIST`;
+  unsupported rates and the whole group on EEG-less devices are hidden).
 - **Replay Bin File**: replays a `.bin` capture through the normal parse
-  pipeline (realtime; Pause/Resume/Stop). **Analyze Bin** parses a capture
-  to CSV offline and opens the result.
+  pipeline (realtime; Pause/Resume/Stop). The header row right of the SDK
+  version label carries a **Multi Start/Stop** toggle button (synchronized
+  stream start/stop across all connected devices; reads "Multi Stop" while
+  any device is streaming) and **Multi Replay Bin**
+  (pick several captures for a synchronized group replay on one shared
+  clock aligned by their recorded timestamps; pause/resume apply to the
+  whole group, stop stays per device). **Analyze Bin** parses a capture to
+  CSV offline and opens the result.
 
 SDK callbacks arrive on SDK threads; the data callback only enqueues batches
 (a worker thread feeds the display rings), and everything UI-side is

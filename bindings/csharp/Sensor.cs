@@ -633,10 +633,13 @@ namespace SensorSdk
         /// </summary>
         public event Action<SensorProfile, bool>? DataTransferStateChanged;
         /// <summary>
-        /// Return true to take over session recovery yourself, false for the
-        /// SDK's default init -> setParam replay -> stream restart flow.
+        /// Gates session recovery after an auto reconnect. Answer through the
+        /// passed action, exactly once and from any thread: answer(true) takes
+        /// over the recovery yourself, answer(false) runs the SDK's default
+        /// init -> setParam replay -> stream restart flow. If no answer
+        /// arrives within 10 s the SDK runs the default recovery.
         /// </summary>
-        public Func<SensorProfile, bool, bool>? OnAutoReconnect { get; set; }
+        public Action<SensorProfile, bool, Action<bool>>? OnAutoReconnect { get; set; }
 
         internal SensorProfile(IntPtr handle)
         {
@@ -803,11 +806,16 @@ namespace SensorSdk
         internal void RaisePower(int power)
             => PowerChanged?.Invoke(this, power);
 
-        internal int RaiseAutoReconnect(int hasLastSession)
+        internal void RaiseAutoReconnect(int hasLastSession, IntPtr answer, IntPtr answerCtx)
         {
+            var answerFn = Marshal.GetDelegateForFunctionPointer<SenAutoReconnectAnswerCb>(answer);
             var handler = OnAutoReconnect;
-            if (handler == null) return 0;
-            return handler(this, hasLastSession != 0) ? 1 : 0;
+            if (handler == null)
+            {
+                answerFn(answerCtx, 0);
+                return;
+            }
+            handler(this, hasLastSession != 0, handled => answerFn(answerCtx, handled ? 1 : 0));
         }
 
         internal void RaiseDeviceInfoUpdate(IntPtr info)
@@ -844,6 +852,7 @@ namespace SensorSdk
         internal static readonly SenParamCb Param = OnParam;
         internal static readonly SenBatteryCb Battery = OnBattery;
         internal static readonly SenInfoCb Info = OnInfo;
+        internal static readonly SenMultiResultCb MultiResult = OnMultiResult;
 
         private static SensorProfile ProfileFromCtx(IntPtr ctx)
             => (SensorProfile)GCHandle.FromIntPtr(ctx).Target!;
@@ -865,8 +874,9 @@ namespace SensorSdk
             => ProfileFromCtx(ctx).RaisePower(power);
 
         [MonoPInvokeCallback(typeof(SenAutoReconnectCb))]
-        private static int OnAutoReconnect(IntPtr ctx, IntPtr profile, int hasLastSession)
-            => ProfileFromCtx(ctx).RaiseAutoReconnect(hasLastSession);
+        private static void OnAutoReconnect(IntPtr ctx, IntPtr profile, int hasLastSession,
+                                            IntPtr answer, IntPtr answerCtx)
+            => ProfileFromCtx(ctx).RaiseAutoReconnect(hasLastSession, answer, answerCtx);
 
         [MonoPInvokeCallback(typeof(SenDeviceInfoUpdateCb))]
         private static void OnDeviceInfoUpdate(IntPtr ctx, IntPtr profile, IntPtr info)
@@ -910,6 +920,11 @@ namespace SensorSdk
                 SenDeviceInfo native = Marshal.PtrToStructure<SenDeviceInfo>(info);
                 return DeviceInfo.FromNative(in native);
             });
+
+        [MonoPInvokeCallback(typeof(SenMultiResultCb))]
+        private static void OnMultiResult(
+            IntPtr ctx, IntPtr macs, IntPtr oks, IntPtr errors, UIntPtr count)
+            => MultiResultOp.Complete(ctx, macs, oks, errors, count);
     }
 
     /// <summary>
@@ -934,6 +949,51 @@ namespace SensorSdk
             op._handle.Free();
             if (err.Length == 0) op._tcs.TrySetResult(map(err));
             else op._tcs.TrySetException(new SensorException(err));
+        }
+    }
+
+    /// <summary>
+    /// One in-flight synchronized multi-device start/stop operation. Same
+    /// rooting rules as CompletionOp: the GCHandle is the ctx passed to the
+    /// SDK and is freed exactly once, when the result callback fires.
+    /// </summary>
+    internal sealed class MultiResultOp
+    {
+        private readonly TaskCompletionSource<Dictionary<string, bool>> _tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly GCHandle _handle;
+        private readonly Dictionary<string, string>? _errors;
+
+        internal MultiResultOp(Dictionary<string, string>? errors)
+        {
+            _handle = GCHandle.Alloc(this);
+            _errors = errors;
+        }
+
+        internal IntPtr CtxPtr => GCHandle.ToIntPtr(_handle);
+        internal Task<Dictionary<string, bool>> Task => _tcs.Task;
+
+        internal static void Complete(
+            IntPtr ctx, IntPtr macs, IntPtr oks, IntPtr errors, UIntPtr count)
+        {
+            var op = (MultiResultOp)GCHandle.FromIntPtr(ctx).Target!;
+            op._handle.Free();
+            int n = checked((int)count);
+            var result = new Dictionary<string, bool>(n);
+            for (int i = 0; i < n; i++)
+            {
+                string mac = CapiString.FromPtr(Marshal.ReadIntPtr(macs, i * IntPtr.Size));
+                bool ok = Marshal.ReadInt32(oks, i * sizeof(int)) != 0;
+                result[mac] = ok;
+                if (op._errors != null)
+                {
+                    string err = errors == IntPtr.Zero
+                        ? string.Empty
+                        : CapiString.FromPtr(Marshal.ReadIntPtr(errors, i * IntPtr.Size));
+                    op._errors[mac] = err;
+                }
+            }
+            op._tcs.TrySetResult(result);
         }
     }
 
@@ -1139,6 +1199,66 @@ namespace SensorSdk
             }
         }
 
+        /* ---- synchronized multi-device stream start/stop ---- */
+
+        /// <summary>
+        /// Starts the data stream on several devices with their start writes
+        /// released together, so the streams begin as simultaneously as the
+        /// link allows (Python multiStartDataNotification parity). When the
+        /// spread of the first-packet delays exceeds maxDelayDispersionMs the
+        /// round is torn down and retried, up to maxAttempts rounds. Resolves
+        /// with mac -> ok for every participant (invalid or not-ready devices
+        /// get their own false entry); when errors is supplied it is filled
+        /// with the per-device result string ("" on success) before the task
+        /// completes. Participants that are already streaming are restarted.
+        /// </summary>
+        public Task<Dictionary<string, bool>> MultiStartDataNotificationAsync(
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 30000,
+            int maxDelayDispersionMs = 5, int maxAttempts = 3,
+            Dictionary<string, string>? errors = null)
+        {
+            IntPtr[] handles = CollectHandles(sensors);
+            var op = new MultiResultOp(errors);
+            Native.sen_controller_multi_start_data(_handle, handles,
+                (UIntPtr)handles.Length, timeoutMs, maxDelayDispersionMs,
+                maxAttempts, NativeCallbacks.MultiResult, op.CtxPtr);
+            return op.Task;
+        }
+
+        /// <summary>
+        /// Stops the data stream on several devices with their stop writes
+        /// released together (Python multiStopDataNotification parity).
+        /// Devices that are not streaming report success immediately.
+        /// Resolves with mac -> ok for every participant; when errors is
+        /// supplied it is filled with the per-device result string ("" on
+        /// success) before the task completes.
+        /// </summary>
+        public Task<Dictionary<string, bool>> MultiStopDataNotificationAsync(
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 10000,
+            Dictionary<string, string>? errors = null)
+        {
+            IntPtr[] handles = CollectHandles(sensors);
+            var op = new MultiResultOp(errors);
+            Native.sen_controller_multi_stop_data(_handle, handles,
+                (UIntPtr)handles.Length, timeoutMs, NativeCallbacks.MultiResult,
+                op.CtxPtr);
+            return op.Task;
+        }
+
+        private static IntPtr[] CollectHandles(IReadOnlyList<SensorProfile> sensors)
+        {
+            if (sensors == null) throw new ArgumentNullException(nameof(sensors));
+            var handles = new IntPtr[sensors.Count];
+            for (int i = 0; i < sensors.Count; i++)
+            {
+                if (sensors[i] == null)
+                    throw new ArgumentException(
+                        "sensors must not contain null entries", nameof(sensors));
+                handles[i] = sensors[i].Handle;
+            }
+            return handles;
+        }
+
         /* ---- bin capture inspection and offline replay ---- */
 
         public BinFileInfo? GetBinFileInfo(string path)
@@ -1158,6 +1278,32 @@ namespace SensorSdk
             IntPtr p = Native.sen_controller_replay_bin_file(
                 _handle, path, deviceMac ?? string.Empty, realtime ? 1 : 0, timeoutMs);
             return p == IntPtr.Zero ? null : WrapProfile(p);
+        }
+
+        /// <summary>
+        /// Synchronized multi-bin replay: every (paths[i], macs[i]) capture
+        /// replays on one shared clock aligned by record timestamps (the
+        /// earliest record in the group is t=0, so concurrently recorded
+        /// captures keep their original relative offsets). Pausing/resuming
+        /// any member freezes/resumes the whole group; StopBinReplay stays
+        /// per device. The returned array is input-order aligned; a null
+        /// entry marks a member that failed validation.
+        /// </summary>
+        public SensorProfile?[] MultiReplayBinFile(string[] paths, string[] macs,
+            bool realtime = true, uint timeoutMs = 30000)
+        {
+            if (paths == null) throw new ArgumentNullException(nameof(paths));
+            if (macs == null) throw new ArgumentNullException(nameof(macs));
+            if (paths.Length != macs.Length)
+                throw new ArgumentException("paths and macs must have the same length");
+            var outProfiles = new IntPtr[paths.Length];
+            Native.sen_controller_multi_replay_bin_file(
+                _handle, paths, macs, (UIntPtr)paths.Length,
+                realtime ? 1 : 0, timeoutMs, outProfiles);
+            var result = new SensorProfile?[paths.Length];
+            for (int i = 0; i < paths.Length; i++)
+                result[i] = outProfiles[i] == IntPtr.Zero ? null : WrapProfile(outProfiles[i]);
+            return result;
         }
 
         public string PauseBinReplay(string deviceMac)

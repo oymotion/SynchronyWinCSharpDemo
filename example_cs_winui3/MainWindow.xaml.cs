@@ -21,7 +21,7 @@ public sealed partial class MainWindow : Window
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
     private const int FftUpdateIntervalMs = 500;
-    private const string DemoVersion = "0.1.14";
+    private const string DemoVersion = "0.1.21";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
@@ -45,13 +45,17 @@ public sealed partial class MainWindow : Window
     private readonly List<DeviceEntry> _discovered = new();
     private readonly Dictionary<string, DeviceState> _deviceStates = new();
     private readonly object _statesMutex = new();
-    private readonly HashSet<string> _pendingUserDisconnect = new();
+    // Successful user setParam history per device (insertion order, one entry
+    // per key), replayed by the app-driven auto-reconnect recovery.
+    private readonly Dictionary<string, List<KeyValuePair<string, string>>> _savedParamsByMac = new();
+    // Devices whose next successful stream start should be followed by the
+    // saved-param restore replay.
+    private readonly HashSet<string> _restoreParamsMacs = new();
     private readonly HashSet<string> _streamingMacs = new();
     private string _currentMac = string.Empty;
 
     // Replay state
-    private string _replayMac = string.Empty;
-    private bool _replayStreamingSeen;
+    private readonly List<string> _replayMacs = new();
     private bool _replayStopRequested;
     private bool _replayPaused;
 
@@ -278,7 +282,7 @@ public sealed partial class MainWindow : Window
         AppLog("Stop scan");
         _ctrl.StopScan();
         _scanning = false;
-        ScanButton.IsEnabled = _replayMac.Length == 0;
+        ScanButton.IsEnabled = _replayMacs.Count == 0;
         StopScanButton.IsEnabled = false;
     }
 
@@ -327,12 +331,18 @@ public sealed partial class MainWindow : Window
     {
         string mac = SelectedMac();
         bool connected;
+        int stateCount;
         lock (_statesMutex)
+        {
             connected = mac.Length > 0 && _deviceStates.ContainsKey(mac);
-        bool replaying = _replayMac.Length > 0;
+            stateCount = _deviceStates.Count;
+        }
+        bool replaying = _replayMacs.Count > 0;
         ConnectButton.IsEnabled = !replaying && mac.Length > 0 && !connected;
         DisconnectButton.IsEnabled = !replaying && connected;
         ScanButton.IsEnabled = !replaying && !_scanning;
+        MultiSyncButton.Content = _streamingMacs.Count > 0 ? "Multi Stop" : "Multi Start";
+        MultiSyncButton.IsEnabled = !replaying && stateCount >= 1;
     }
 
     private void UpdateDeviceItemText(string mac, bool connected)
@@ -340,9 +350,9 @@ public sealed partial class MainWindow : Window
         DeviceRow? row = DeviceList.Items.OfType<DeviceRow>().FirstOrDefault(r => r.Mac == mac);
         if (row == null)
             return;
-        if (mac == _replayMac)
+        if (_replayMacs.Contains(mac))
         {
-            UpdateReplayItemText();
+            UpdateReplayItemText(mac);
             return;
         }
         string name = mac;
@@ -429,11 +439,43 @@ public sealed partial class MainWindow : Window
         profile.PowerChanged += (_, power) => Post(() => OnPowerChanged(mac, power));
         profile.DeviceInfoUpdated += (_, _) => Post(() => OnDeviceInfoUpdate(mac));
         profile.DataTransferStateChanged += (_, on) => Post(() => OnDataTransferStateChanged(mac, on));
-        profile.OnAutoReconnect = (p, hasLastSession) =>
+        profile.OnAutoReconnect = (p, hasLastSession, answer) =>
         {
             p.Log("App: auto reconnect callback received, restore=" + (hasLastSession ? "True" : "False"));
-            return false;
+            Post(() => RecoverDevice(mac, hasLastSession));
+            answer(true);
         };
+    }
+
+    private async void RecoverDevice(string mac, bool restore)
+    {
+        // App-driven recovery: re-select the row and re-run the connect
+        // chain; the recorded setParam history replays after the stream
+        // start.
+        DeviceRow? row = DeviceList.Items.OfType<DeviceRow>().FirstOrDefault(r => r.Mac == mac);
+        if (row != null)
+            DeviceList.SelectedItem = row;
+        lock (_statesMutex)
+        {
+            if (_deviceStates.ContainsKey(mac))
+                return;
+        }
+        SensorProfile? profile = _ctrl.GetSensor(mac);
+        if (profile == null)
+            return;
+        if (restore)
+            _restoreParamsMacs.Add(mac);
+        string name = mac;
+        foreach (DeviceEntry d in _discovered)
+            if (d.Mac == mac) { name = d.Name; break; }
+        var st = new DeviceState(profile) { Name = name };
+        st.LiveFilterState.SetBand(FilterCombo.SelectedIndex);
+        lock (_statesMutex)
+            _deviceStates[mac] = st;
+        _currentMac = mac;
+        RetargetWaveforms();
+        RefreshInfoPanel();
+        await RunConnectChain(st);
     }
 
     private async Task RunConnectChain(DeviceState st)
@@ -492,8 +534,11 @@ public sealed partial class MainWindow : Window
             st.FlowStarted = true;
             AppLog($"App: device connected and streaming: {st.Name} ({st.Mac})", "I", st);
             UpdateDeviceItemText(st.Mac, true);
-            ApplySessionParams(st);
-            RefreshControlStates(st);
+            await ApplySessionParams(st);
+            if (_restoreParamsMacs.Remove(st.Mac))
+                await RestoreSavedParams(st);
+            else
+                RefreshControlStates(st);
             if (_currentMac == st.Mac)
             {
                 RefreshInfoPanel();
@@ -537,14 +582,12 @@ public sealed partial class MainWindow : Window
             rb.IsEnabled = false;
         if (st.Profile.DeviceState == SenDeviceState.Disconnected)
         {
-            _pendingUserDisconnect.Add(st.Mac);
             OnStateChanged(st.Mac, SenDeviceState.Disconnected);
             return;
         }
         DisconnectButton.IsEnabled = false;
         ConnectButton.IsEnabled = false;
         StatusText.Text = "Disconnecting...";
-        _pendingUserDisconnect.Add(st.Mac);
         _ = st.Profile.DisconnectAsync();
     }
 
@@ -603,13 +646,10 @@ public sealed partial class MainWindow : Window
         }
         if (state != SenDeviceState.Disconnected || st == null || st.IsReplay)
             return;
-        bool byUser = _pendingUserDisconnect.Remove(mac);
-        if (!byUser && AutoReconnectBox.IsChecked == true)
-        {
-            if (mac == _currentMac)
-                StatusText.Text = "Connection lost, auto reconnecting ...";
-            return;
-        }
+        // Every disconnect tears the UI state down; with Auto Reconnect on,
+        // the app-driven recovery (RecoverDevice) rebuilds it once the link
+        // is back.
+        _restoreParamsMacs.Remove(mac);
         st.NtfStates.Clear();
         st.FilterStates.Clear();
         st.SampleRateOptions.Clear();
@@ -683,34 +723,31 @@ public sealed partial class MainWindow : Window
         else
             _streamingMacs.Remove(mac);
         AppLog($"App: data stream {(isTransferring ? "ON" : "OFF")} {mac}", "I", st);
-        if (mac == _replayMac)
+        if (_replayMacs.Contains(mac))
         {
-            UpdateReplayItemText();
-            if (isTransferring)
+            UpdateReplayItemText(mac);
+            if (!isTransferring)
             {
-                // Replay data start.
-                _replayStreamingSeen = true;
-            }
-            else if (_replayStreamingSeen || _replayStopRequested)
-            {
-                OnReplayDone(_replayStopRequested ? "Replay stopped" : "Replay finished");
+                // Replay EOF (or a user stop): finish the member here.
+                OnReplayDone(mac, _replayStopRequested ? "Replay stopped" : "Replay finished");
             }
             return;
         }
         UpdateDeviceItemText(mac, st != null);
+        UpdateButtonStates();
     }
 
-    private void UpdateReplayItemText()
+    private void UpdateReplayItemText(string mac)
     {
-        if (_replayMac.Length == 0)
+        if (!_replayMacs.Contains(mac))
             return;
-        DeviceState? st = StateFor(_replayMac);
+        DeviceState? st = StateFor(mac);
         if (st == null)
             return;
-        string prefix = _streamingMacs.Contains(_replayMac) ? "[Streaming] [Replay] " : "[Replay] ";
-        DeviceRow? row = DeviceList.Items.OfType<DeviceRow>().FirstOrDefault(r => r.Mac == _replayMac);
+        string prefix = _streamingMacs.Contains(mac) ? "[Streaming] [Replay] " : "[Replay] ";
+        DeviceRow? row = DeviceList.Items.OfType<DeviceRow>().FirstOrDefault(r => r.Mac == mac);
         if (row != null)
-            row.Text = $"{prefix}{st.Name}, Address: {_replayMac}";
+            row.Text = $"{prefix}{st.Name}, Address: {mac}";
     }
 
     // ------------------------------------------------------------------
@@ -746,6 +783,7 @@ public sealed partial class MainWindow : Window
         string value = cb.IsChecked == true ? "ON" : "OFF";
         (string msg, bool isError) = await SendSetParam(st.Profile, key, value);
         AppLog($"User: setParam({key}, {value}) -> {msg}");
+        RecordSavedParam(st.Mac, key, value, msg);
         if (isError)
         {
             ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
@@ -766,6 +804,7 @@ public sealed partial class MainWindow : Window
         string value = cb.IsChecked == true ? "ON" : "OFF";
         (string msg, bool isError) = await SendSetParam(st.Profile, key, value);
         AppLog($"User: setParam({key}, {value}) -> {msg}");
+        RecordSavedParam(st.Mac, key, value, msg);
         if (isError)
         {
             ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
@@ -786,6 +825,7 @@ public sealed partial class MainWindow : Window
         string value = rate.ToString();
         (string msg, bool isError) = await SendSetParam(st.Profile, "EEG_SAMPLE_RATE", value);
         AppLog($"User: setParam(EEG_SAMPLE_RATE, {value}) -> {msg}");
+        RecordSavedParam(st.Mac, "EEG_SAMPLE_RATE", value, msg);
         if (isError)
         {
             ShowWarning("Set Parameter Failed", $"Failed to set EEG_SAMPLE_RATE:\n{msg}");
@@ -1006,17 +1046,18 @@ public sealed partial class MainWindow : Window
             ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
     }
 
-    private void ApplySessionParams(DeviceState st)
+    private async Task ApplySessionParams(DeviceState st)
     {
+        // One setParam at a time (the SDK serializes setParam per profile).
         if (_debugLogEnabled)
         {
             string path = _lastLogPaths.GetValueOrDefault(st.Mac, "True");
-            _ = ApplySessionParam(st, "DEBUG_LOG_PATH", path, _lastLogPaths);
+            await ApplySessionParam(st, "DEBUG_LOG_PATH", path, _lastLogPaths);
         }
         if (_binDataEnabled)
         {
             string path = _lastDataPaths.GetValueOrDefault(st.Mac, "True");
-            _ = ApplySessionParam(st, "DEBUG_BLE_DATA_PATH", path, _lastDataPaths);
+            await ApplySessionParam(st, "DEBUG_BLE_DATA_PATH", path, _lastDataPaths);
         }
     }
 
@@ -1029,6 +1070,37 @@ public sealed partial class MainWindow : Window
         string cur = await SafeGetParam(st.Profile, key);
         if (cur.Length > 0 && !cur.StartsWith("Error"))
             cache[st.Mac] = cur;
+    }
+
+    private void RecordSavedParam(string mac, string key, string value, string result)
+    {
+        if (mac.Length == 0 || result.StartsWith("Error"))
+            return;
+        if (!_savedParamsByMac.TryGetValue(mac, out List<KeyValuePair<string, string>>? saved))
+            _savedParamsByMac[mac] = saved = new List<KeyValuePair<string, string>>();
+        for (int i = 0; i < saved.Count; i++)
+        {
+            if (saved[i].Key == key)
+            {
+                saved[i] = new KeyValuePair<string, string>(key, value);
+                return;
+            }
+        }
+        saved.Add(new KeyValuePair<string, string>(key, value));
+    }
+
+    private async Task RestoreSavedParams(DeviceState st)
+    {
+        string mac = st.Mac;
+        if (!_savedParamsByMac.TryGetValue(mac, out List<KeyValuePair<string, string>>? saved))
+            return;
+        foreach (KeyValuePair<string, string> kv in saved)
+        {
+            (string msg, bool _) = await SendSetParam(st.Profile, kv.Key, kv.Value);
+            AppLog($"App: restore setParam({kv.Key}, {kv.Value}) -> {msg}", "I", StateFor(mac));
+        }
+        RefreshControlStates(StateFor(mac));
+        ClearUiData();
     }
 
     private void OnAutoReconnectToggled(object sender, RoutedEventArgs e)
@@ -1547,7 +1619,112 @@ public sealed partial class MainWindow : Window
                     RateText.Text = st.BuildRateText();
                 }
             }
-            PollReplayEnd();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-device sync start/stop
+    // ------------------------------------------------------------------
+
+    private List<SensorProfile> ReadyProfiles()
+    {
+        lock (_statesMutex)
+            return _deviceStates.Values
+                .Where(st => !st.IsReplay && st.Profile.IsReady && st.Profile.HasInited)
+                .Select(st => st.Profile)
+                .ToList();
+    }
+
+    private async void OnMultiSyncClicked(object sender, RoutedEventArgs e)
+    {
+        if (_streamingMacs.Count > 0)
+            await MultiStop();
+        else
+            await MultiStart();
+    }
+
+    private async Task MultiStart()
+    {
+        List<SensorProfile> sensors = ReadyProfiles();
+        if (sensors.Count == 0)
+        {
+            AppLog("User: multi start rejected (no connected device)", "W");
+            StatusText.Text = "No connected device to sync-start";
+            return;
+        }
+        AppLog($"User: multi start on {sensors.Count} device(s)");
+        MultiSyncButton.IsEnabled = false;
+        try
+        {
+            var transferring = sensors.Where(s => _streamingMacs.Contains(s.Device.Mac)).ToList();
+            if (transferring.Count > 0)
+            {
+                Dictionary<string, bool> stopResults = await _ctrl.MultiStopDataNotificationAsync(transferring);
+                string[] stopFailed = stopResults.Where(kv => !kv.Value).Select(kv => kv.Key).ToArray();
+                if (stopFailed.Length > 0)
+                {
+                    AppLog($"App: multi stop failed on: {string.Join(", ", stopFailed)}", "W");
+                    StatusText.Text = $"Multi stop failed on: {string.Join(", ", stopFailed)}";
+                    return;
+                }
+            }
+            // Multi start params by model set
+            var modelNames = new HashSet<string?>();
+            foreach (SensorProfile s in sensors)
+            {
+                DeviceState? st = StateFor(s.Device.Mac);
+                modelNames.Add(st != null && st.HasInfo ? st.Info.ModelName : null);
+            }
+            Dictionary<string, bool> results = modelNames.Count == 1 && !modelNames.Contains(null)
+                ? await _ctrl.MultiStartDataNotificationAsync(sensors)
+                : await _ctrl.MultiStartDataNotificationAsync(sensors, 60000, -1, 5);
+            string[] failed = results.Where(kv => !kv.Value).Select(kv => kv.Key).ToArray();
+            if (failed.Length > 0)
+            {
+                AppLog($"App: multi start failed on: {string.Join(", ", failed)}", "W");
+                StatusText.Text = $"Multi start failed on: {string.Join(", ", failed)}";
+            }
+            else
+            {
+                AppLog($"App: multi start OK: {results.Count} device(s) started");
+                StatusText.Text = $"Multi start: {results.Count} device(s) started";
+            }
+        }
+        finally
+        {
+            UpdateButtonStates();
+        }
+    }
+
+    private async Task MultiStop()
+    {
+        List<SensorProfile> sensors = ReadyProfiles();
+        if (sensors.Count == 0)
+        {
+            AppLog("User: multi stop rejected (no connected device)", "W");
+            StatusText.Text = "No connected device to sync-stop";
+            return;
+        }
+        AppLog($"User: multi stop on {sensors.Count} device(s)");
+        MultiSyncButton.IsEnabled = false;
+        try
+        {
+            Dictionary<string, bool> results = await _ctrl.MultiStopDataNotificationAsync(sensors);
+            string[] failed = results.Where(kv => !kv.Value).Select(kv => kv.Key).ToArray();
+            if (failed.Length > 0)
+            {
+                AppLog($"App: multi stop failed on: {string.Join(", ", failed)}", "W");
+                StatusText.Text = $"Multi stop failed on: {string.Join(", ", failed)}";
+            }
+            else
+            {
+                AppLog($"App: multi stop OK: {results.Count} device(s) stopped");
+                StatusText.Text = $"Multi stop: {results.Count} device(s) stopped";
+            }
+        }
+        finally
+        {
+            UpdateButtonStates();
         }
     }
 
@@ -1568,6 +1745,7 @@ public sealed partial class MainWindow : Window
         DebugLogBox.IsEnabled = !replaying;
         BinDataBox.IsEnabled = !replaying;
         ReplayButton.IsEnabled = !replaying;
+        MultiReplayButton.IsEnabled = !replaying;
         ReplayPauseButton.IsEnabled = replaying;
         ReplayPauseButton.Content = "Pause Replay";
         ReplayStopButton.IsEnabled = replaying;
@@ -1575,6 +1753,7 @@ public sealed partial class MainWindow : Window
         {
             ConnectButton.IsEnabled = false;
             DisconnectButton.IsEnabled = false;
+            MultiSyncButton.IsEnabled = false;
         }
         else
         {
@@ -1595,6 +1774,18 @@ public sealed partial class MainWindow : Window
         return file?.Path;
     }
 
+    private async Task<IReadOnlyList<Windows.Storage.StorageFile>> PickBinFiles(string title)
+    {
+        var picker = new Windows.Storage.Pickers.FileOpenPicker
+        {
+            SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary,
+        };
+        picker.FileTypeFilter.Add(".bin");
+        IntPtr hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+        return await picker.PickMultipleFilesAsync();
+    }
+
     private async void OnReplayClicked(object sender, RoutedEventArgs e)
     {
         lock (_statesMutex)
@@ -1605,11 +1796,43 @@ public sealed partial class MainWindow : Window
                 return;
             }
         }
-        if (_replayMac.Length > 0)
+        if (_replayMacs.Count > 0)
             return;
         string? path = await PickBinFile("Select Bin File");
         if (path == null)
             return;
+        StartReplay(path);
+    }
+
+    private async void OnMultiReplayClicked(object sender, RoutedEventArgs e)
+    {
+        lock (_statesMutex)
+        {
+            if (_deviceStates.Count > 0)
+            {
+                StatusText.Text = "Please disconnect all devices before replaying bin files";
+                return;
+            }
+        }
+        if (_replayMacs.Count > 0)
+            return;
+        IReadOnlyList<Windows.Storage.StorageFile> files = await PickBinFiles("Select Bin Files");
+        if (files.Count == 0)
+            return;
+        var paths = files.Select(f => f.Path.Trim()).Where(p => p.Length > 0).ToList();
+        if (paths.Count == 0)
+            return;
+        if (paths.Count > 1)
+        {
+            StartMultiReplay(paths);
+            return;
+        }
+        StartReplay(paths[0]);
+    }
+
+    // Single-bin replay start
+    private void StartReplay(string path)
+    {
         AppLog($"User: replay bin file: {path}");
         BinFileInfo? info = _ctrl.GetBinFileInfo(path);
         if (info == null || !info.Valid || info.Mac.Length == 0)
@@ -1626,8 +1849,7 @@ public sealed partial class MainWindow : Window
         }
         HookProfileEvents(profile);
 
-        _replayMac = info.Mac;
-        _replayStreamingSeen = false;
+        _replayMacs.Add(info.Mac);
         _replayStopRequested = false;
         _replayPaused = false;
 
@@ -1639,12 +1861,12 @@ public sealed partial class MainWindow : Window
         };
         st.LiveFilterState.SetBand(FilterCombo.SelectedIndex);
         lock (_statesMutex)
-            _deviceStates[_replayMac] = st;
+            _deviceStates[info.Mac] = st;
 
-        var row = new DeviceRow(_replayMac, $"[Replay] {st.Name}, Address: {_replayMac}");
+        var row = new DeviceRow(info.Mac, $"[Replay] {st.Name}, Address: {info.Mac}");
         DeviceList.Items.Add(row);
         DeviceList.SelectedItem = row;
-        _currentMac = _replayMac;
+        _currentMac = info.Mac;
 
         if (info.DeviceInfo.EEGSampleRate > 0)
         {
@@ -1658,18 +1880,97 @@ public sealed partial class MainWindow : Window
         SetReplayModeUi(true);
     }
 
+    // Multi-bin synchronized replay start
+    private void StartMultiReplay(List<string> paths)
+    {
+        AppLog($"User: replay {paths.Count} bin files: {string.Join("; ", paths)}");
+        var infos = new BinFileInfo[paths.Count];
+        for (int i = 0; i < paths.Count; i++)
+        {
+            BinFileInfo? info = _ctrl.GetBinFileInfo(paths[i]);
+            if (info == null || !info.Valid || info.Mac.Length == 0)
+            {
+                AppLog($"App: invalid bin file (no config record): {paths[i]}", "W");
+                StatusText.Text = "Invalid bin file: no config record found";
+                return;
+            }
+            infos[i] = info;
+        }
+        string[] macs = infos.Select(x => x.Mac).ToArray();
+        if (macs.Distinct().Count() != macs.Length)
+        {
+            AppLog("App: replay aborted: duplicate device address among bin files", "W");
+            StatusText.Text = "Replay aborted: duplicate device address among bin files";
+            return;
+        }
+        SensorProfile?[] profiles = _ctrl.MultiReplayBinFile(paths.ToArray(), macs, true, ReplayDelegateTimeoutMs);
+        int started = 0;
+        for (int i = 0; i < profiles.Length; i++)
+        {
+            SensorProfile? profile = profiles[i];
+            if (profile == null)
+            {
+                AppLog($"App: replay member failed to start: {paths[i]}", "W");
+                continue;
+            }
+            HookProfileEvents(profile);
+            string mac = macs[i];
+            var st = new DeviceState(profile)
+            {
+                IsReplay = true,
+                FlowStarted = true,
+                Name = infos[i].DeviceName,
+            };
+            st.LiveFilterState.SetBand(FilterCombo.SelectedIndex);
+            lock (_statesMutex)
+                _deviceStates[mac] = st;
+            var row = new DeviceRow(mac, $"[Replay] {st.Name}, Address: {mac}");
+            DeviceList.Items.Add(row);
+            if (started == 0)
+            {
+                DeviceList.SelectedItem = row;
+                _currentMac = mac;
+            }
+            if (infos[i].DeviceInfo.EEGSampleRate > 0)
+            {
+                st.SampleRateCurrent = infos[i].DeviceInfo.EEGSampleRate;
+                if (mac == _currentMac)
+                    SetSampleRateChecked(st.SampleRateCurrent);
+            }
+            _replayMacs.Add(mac);
+            started++;
+        }
+        if (started == 0)
+        {
+            StatusText.Text = "Replay failed to start";
+            return;
+        }
+        _replayStopRequested = false;
+        _replayPaused = false;
+        RetargetWaveforms();
+        RefreshInfoPanel();
+        StatusText.Text = $"Replaying {started} bin files (realtime) ...";
+        SetReplayModeUi(true);
+    }
+
     private void OnReplayPauseResume(object sender, RoutedEventArgs e)
     {
-        if (_replayMac.Length == 0)
+        if (_replayMacs.Count == 0)
             return;
         string action = _replayPaused ? "resume" : "pause";
-        string result = _replayPaused
-            ? _ctrl.ResumeBinReplay(_replayMac)
-            : _ctrl.PauseBinReplay(_replayMac);
-        AppLog($"User: {action} replay -> {result}", result == "OK" ? "I" : "W", StateFor(_replayMac));
-        if (result != "OK")
+        bool allOk = true;
+        foreach (string mac in _replayMacs)
         {
-            StatusText.Text = "Replay pause/resume failed: " + result;
+            string result = _replayPaused
+                ? _ctrl.ResumeBinReplay(mac)
+                : _ctrl.PauseBinReplay(mac);
+            AppLog($"User: {action} replay -> {result}", result == "OK" ? "I" : "W", StateFor(mac));
+            if (result != "OK")
+                allOk = false;
+        }
+        if (!allOk)
+        {
+            StatusText.Text = "Replay pause/resume failed";
             return;
         }
         _replayPaused = !_replayPaused;
@@ -1679,16 +1980,22 @@ public sealed partial class MainWindow : Window
 
     private void OnReplayStop(object sender, RoutedEventArgs e)
     {
-        if (_replayMac.Length == 0)
+        if (_replayMacs.Count == 0)
             return;
         _replayStopRequested = true;
         ReplayStopButton.IsEnabled = false;
         ReplayPauseButton.IsEnabled = false;
-        string result = _ctrl.StopBinReplay(_replayMac);
-        AppLog($"User: stop replay -> {result}", result == "OK" ? "I" : "W", StateFor(_replayMac));
-        if (result != "OK")
+        bool anyOk = false;
+        foreach (string mac in _replayMacs.ToList())
         {
-            StatusText.Text = "Stop replay failed: " + result;
+            string result = _ctrl.StopBinReplay(mac);
+            AppLog($"User: stop replay -> {result}", result == "OK" ? "I" : "W", StateFor(mac));
+            if (result == "OK")
+                anyOk = true;
+        }
+        if (!anyOk)
+        {
+            StatusText.Text = "Stop replay failed";
             _replayStopRequested = false;
             ReplayStopButton.IsEnabled = true;
             ReplayPauseButton.IsEnabled = true;
@@ -1697,29 +2004,10 @@ public sealed partial class MainWindow : Window
         StatusText.Text = "Stopping replay ...";
     }
 
-    private void PollReplayEnd()
+    private void OnReplayDone(string mac, string message)
     {
-        if (_replayMac.Length == 0)
+        if (!_replayMacs.Contains(mac))
             return;
-        DeviceState? st = StateFor(_replayMac);
-        if (st == null)
-            return;
-        if (st.Profile.IsDataTransfering)
-        {
-            _replayStreamingSeen = true;
-            return;
-        }
-        if (_replayStreamingSeen || _replayStopRequested)
-            OnReplayDone(_replayStopRequested ? "Replay stopped" : "Replay finished");
-    }
-
-    private void OnReplayDone(string message)
-    {
-        if (_replayMac.Length == 0)
-        {
-            return;
-        }
-        string mac = _replayMac;
         AppLog($"App: replay done: {message}", "I", StateFor(mac));
         lock (_statesMutex)
             _deviceStates.Remove(mac);
@@ -1727,15 +2015,21 @@ public sealed partial class MainWindow : Window
         DeviceRow? row = DeviceList.Items.OfType<DeviceRow>().FirstOrDefault(r => r.Mac == mac);
         if (row != null)
             DeviceList.Items.Remove(row);
+        _replayMacs.Remove(mac);
         if (_currentMac == mac)
-            _currentMac = string.Empty;
-        _replayMac = string.Empty;
-        _replayStreamingSeen = false;
-        _replayStopRequested = false;
-        _replayPaused = false;
+        {
+            _currentMac = _replayMacs.Count > 0 ? _replayMacs[0] : string.Empty;
+            DeviceRow? next = DeviceList.Items.OfType<DeviceRow>().FirstOrDefault(r => r.Mac == _currentMac);
+            if (next != null)
+                DeviceList.SelectedItem = next;
+        }
         RetargetWaveforms();
         RefreshInfoPanel();
         StatusText.Text = message;
+        if (_replayMacs.Count > 0)
+            return;
+        _replayStopRequested = false;
+        _replayPaused = false;
         SetReplayModeUi(false);
     }
 

@@ -1,5 +1,5 @@
 // P/Invoke declarations for the handle-based flat C API in include/sen_capi.h
-// (39 sen_* functions). Every struct mirrors the C layout exactly
+// (44 sen_* functions). Every struct mirrors the C layout exactly
 // (LayoutKind.Sequential, default pack); structSize-versioned structs must be
 // constructed with structSize = Marshal.SizeOf<T>() before being passed in.
 //
@@ -238,10 +238,15 @@ namespace SensorSdk.Capi
     internal delegate void SenErrorCb(IntPtr ctx, IntPtr profile, IntPtr errorMsg);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenPowerCb(IntPtr ctx, IntPtr profile, int power);
-    // Return non-zero to take over session recovery yourself, zero for the
-    // SDK's default init -> setParam replay -> stream restart flow.
+    // Answer callback for SenAutoReconnectCb: call it exactly once, from any
+    // thread, with non-zero to take over session recovery yourself, zero for
+    // the SDK's default init -> setParam replay -> stream restart flow. If no
+    // answer arrives within 10 s the SDK runs the default recovery.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate int SenAutoReconnectCb(IntPtr ctx, IntPtr profile, int hasLastSession);
+    internal delegate void SenAutoReconnectAnswerCb(IntPtr answerCtx, int handled);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate void SenAutoReconnectCb(IntPtr ctx, IntPtr profile, int hasLastSession,
+                                              IntPtr answer, IntPtr answerCtx);
     // DeviceInfo field change push (aligned with the Python SDK 0.7.0
     // onDeviceInfoUpdate): fired after the cached DeviceInfo was updated in
     // place (e.g. setParam "EEG_SAMPLE_RATE" rewrote the bound EEG/ECG rates).
@@ -286,13 +291,26 @@ namespace SensorSdk.Capi
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenInfoCb(IntPtr ctx, IntPtr info, IntPtr errorMsg);
 
+    // Synchronized multi-device start/stop result (sen_multi_result_cb):
+    // macs/oks/errors are parallel borrowed arrays of count entries
+    // (char* / int / char*), valid for the callback scope only; the error
+    // strings are empty on success.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate void SenMultiResultCb(
+        IntPtr ctx, IntPtr macs, IntPtr oks, IntPtr errors, UIntPtr count);
+
     internal static class Native
     {
+#if UNITY_IOS && !UNITY_EDITOR
+        // iOS statically links the SDK into the Unity binary.
+        private const string Dll = "__Internal";
+#else
         private const string Dll = "sensor";
+#endif
         private const CallingConvention Cc = CallingConvention.Cdecl;
 
         // Mirror of SEN_CAPI_VERSION in sen_capi.h; bump in sync with the header.
-        internal const uint ExpectedCapiVersion = 7;
+        internal const uint ExpectedCapiVersion = 10;
 
         /* ---- controller ---- */
 
@@ -373,6 +391,14 @@ namespace SensorSdk.Capi
             int realtime, uint timeoutMs);
 
         [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
+        internal static extern UIntPtr sen_controller_multi_replay_bin_file(
+            IntPtr ctrl,
+            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string[] paths,
+            [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string[] macs,
+            UIntPtr count, int realtime, uint timeoutMs,
+            [Out] IntPtr[] outProfiles);
+
+        [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
         internal static extern void sen_controller_pause_bin_replay(
             IntPtr ctrl, [MarshalAs(UnmanagedType.LPStr)] string deviceMac,
             IntPtr buf, UIntPtr len);
@@ -397,6 +423,19 @@ namespace SensorSdk.Capi
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_controller_get_version(
             IntPtr ctrl, IntPtr buf, UIntPtr len);
+
+        // Synchronized multi-device stream start/stop: cb fires exactly once
+        // with the per-device results (see SenMultiResultCb).
+        [DllImport(Dll, CallingConvention = Cc)]
+        internal static extern void sen_controller_multi_start_data(
+            IntPtr ctrl, IntPtr[] profiles, UIntPtr count,
+            int timeoutMs, int maxDelayDispersionMs, int maxAttempts,
+            SenMultiResultCb cb, IntPtr ctx);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        internal static extern void sen_controller_multi_stop_data(
+            IntPtr ctrl, IntPtr[] profiles, UIntPtr count,
+            int timeoutMs, SenMultiResultCb cb, IntPtr ctx);
 
         /* ---- profile ---- */
 

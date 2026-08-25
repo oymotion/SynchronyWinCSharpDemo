@@ -1,7 +1,7 @@
 # C# Bindings for the sen_* Flat C API
 
 Thin managed bindings over the handle-based flat C API declared in
-`include/sen_capi.h` (39 `sen_*` functions, built into `sensor.dll`). The
+`include/sen_capi.h` (45 `sen_*` functions, built into `sensor.dll`). The
 binding layer carries zero logic: error strings, subscription masks, and
 session recovery all live inside the SDK and match the Python SDK
 (SensorSDKPython) verbatim. The legacy polling-API binding
@@ -79,6 +79,15 @@ All events (`DataReceived`, `StateChanged`, `ErrorReceived`, `PowerChanged`,
 `DeviceFound`, `EnableChanged`) fire on internal SDK threads — never on the
 caller's UI thread. Do not call blocking SDK functions from inside an event
 handler; marshal to your own thread if you need to.
+
+`SensorProfile.OnAutoReconnect` (a settable delegate, not an event) gates
+stream recovery after an abnormal disconnect: it receives
+`(profile, hasLastSession, answer)` and answers asynchronously through the
+passed `Action<bool>` — call it exactly once, from any thread, at any later
+time. `answer(true)` = the app takes over recovery itself and the SDK skips
+its default flow; `answer(false)` (the default when the delegate is unset,
+or when no answer arrives within 10 s) = the SDK runs its default recovery
+(reconnect, init replay, setParam replay, stream restart).
 
 ## Async model
 
