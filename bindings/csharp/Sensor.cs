@@ -1,36 +1,17 @@
-// Managed wrappers over the sen_* flat C API (SensorCapi.cs). The binding is
-// deliberately thin: all behavior (error strings, subscription masks, session
-// recovery) lives inside the SDK. Public method names mirror the Python SDK
-// (SensorSDKPython): SensorController.startScan/requireSensor/getBinFileInfo/
-// replayBinFile/parseBinToCsv/getVersion/setDebugEnabled, SensorProfile
-// connect/init/startDataNotification/setParam/getParam/getBatteryLevel/
-// setAutoReconnect etc.
-//
-// Async model: the C API's per-operation completion callbacks
-// (init/start/stop/setParam/getParam/battery/fetchDeviceInfo) are exposed as
-// Task-returning async methods backed by TaskCompletionSource. A non-empty
-// errorMsg from the SDK becomes a SensorException.
-//
-// Threading: events fire on internal SDK threads (never the caller's UI
-// thread). Do not call blocking SDK functions from inside an event handler.
-
-// Keep this directive: the file uses nullable reference annotations, which
-// otherwise raise CS8632 in legacy projects that do not enable Nullable
-// (.NET Framework 4.8, Unity pre-2022 project defaults). This is a compile-
-// time feature only - it does not change which runtime the code needs.
 #nullable enable
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using AOT;
 using SensorSdk.Capi;
 
 namespace SensorSdk
 {
-    /// <summary>An SDK-reported error (errorMsg strings match the Python SDK).</summary>
     public sealed class SensorException : Exception
     {
         public SensorException(string message) : base(message) { }
@@ -67,17 +48,72 @@ namespace SensorSdk
         }
     }
 
-    /// <summary>
-    /// One sample of one channel. A POCO constructed on demand by
-    /// SensorData.GetChannelSample - the binding never materializes Samples
-    /// for a whole batch (reads go straight into the backing buffer).
-    /// </summary>
+    internal static class CallbackGuard
+    {
+        private static readonly ConcurrentDictionary<int, byte> SdkCallbackThreads = new();
+
+        internal static void Log(Exception ex)
+            => Console.Error.WriteLine("sensor callback threw: " + ex);
+
+        internal static void MarkSdkCallbackThread()
+            => SdkCallbackThreads.TryAdd(Environment.CurrentManagedThreadId, 0);
+
+        internal static void ThrowOnSdkCallbackThread()
+        {
+            if (SdkCallbackThreads.ContainsKey(Environment.CurrentManagedThreadId))
+                throw new InvalidOperationException(
+                    "blocking sync call from an SDK callback thread");
+        }
+    }
+
+    internal static class SyncWait
+    {
+        internal static bool Await(Task op, int backstopMs)
+        {
+            if (Task.WhenAny(op, Task.Delay(backstopMs)).GetAwaiter().GetResult() != op)
+                return false;
+            try
+            {
+                op.GetAwaiter().GetResult();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal static T Await<T>(Task<T> op, int backstopMs, T timeoutValue)
+        {
+            if (Task.WhenAny(op, Task.Delay(backstopMs)).GetAwaiter().GetResult() != op)
+                return timeoutValue;
+            try
+            {
+                return op.GetAwaiter().GetResult();
+            }
+            catch
+            {
+                return timeoutValue;
+            }
+        }
+
+        internal static string AwaitString(Task<string> op, int backstopMs)
+        {
+            if (Task.WhenAny(op, Task.Delay(backstopMs)).GetAwaiter().GetResult() != op)
+                return "Error: Timeout";
+            try
+            {
+                return op.GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+        }
+    }
+
     public struct Sample
     {
-        /// <summary>LSL-style absolute timestamp (Unix seconds, double):
-        /// stream-start wall clock + first-packet delay (Delay) +
-        /// SampleIndex/SampleRate, computed at decode time; 0 when the
-        /// anchor is unknown.</summary>
         public double AbsTimeStampInSec;
         public int ChannelIndex;
         public int SampleIndex;
@@ -88,39 +124,8 @@ namespace SensorSdk
         public bool IsLost;
     }
 
-    /// <summary>
-    /// One broadcast batch of a single stream. Two backing modes:
-    /// - BORROWED (as delivered by SensorProfile.DataReceived): reads go
-    ///   straight into SDK memory through the native samples pointer
-    ///   (IntPtr, zero copy). The payload is only valid until the
-    ///   DataReceived handler returns; afterwards the SDK may overwrite it
-    ///   at any time. Call <see cref="Clone"/> inside the handler to keep
-    ///   the data.
-    /// - OWNED (after <see cref="Clone"/>): one flat byte[] copied with a
-    ///   single block copy, fully detached from native memory.
-    /// Samples are packed [channel][sample] with the per-channel stride ==
-    /// SampleCount, 40 bytes per sample (fixed little-endian ABI, see
-    /// sen_capi.h). Both backings share one offset-based read path; no
-    /// managed Sample objects are created until GetChannelSample or
-    /// ChannelSamples is called. A slot whose stored sampleIndex !=
-    /// StartSampleIndex + sampleIndex is stale (overwritten by newer data,
-    /// or a zeroed masked-out channel), and a view whose StartTimeStamp no
-    /// longer matches the stream's current value belongs to a previous
-    /// session. The single-slot accessors validate only the index ranges
-    /// (out-of-range throws ArgumentOutOfRangeException) and read the slot
-    /// as-is otherwise: probe <see cref="IsDataValid"/> once per batch first
-    /// (staleness is batch-atomic), or read via the ChannelSamples matrix,
-    /// which fills unreadable slots with default(Sample).
-    /// The metadata properties (DeviceMac .. DeviceName) are a zero-copy borrow
-    /// of the stream's metadata struct inside the SDK: they read straight
-    /// through the borrowed pointer, so LostPackageCount / Delay updates
-    /// remain visible. The borrow follows the same lifetime rules as the
-    /// samples pointer; <see cref="Clone"/> deep-copies the Info into an
-    /// owned struct.
-    /// </summary>
     public sealed class SensorData
     {
-        // sen_sample_t fixed ABI (sen_capi.h, SEN_SAMPLE_SIZE == 40).
         private const int SampleSize = 40;
         private const int OffAbsTimeStamp = 0;
         private const int OffChannelIndex = 8;
@@ -131,7 +136,6 @@ namespace SensorSdk
         private const int OffSaturation = 28;
         private const int OffIsLost = 32;
 
-        // sen_data_info_t fixed layout (sen_capi.h, mirrors SensorData::Info).
         private const int OffInfoDataType = 20;
         private const int OffInfoLostPackageCount = 24;
         private const int OffInfoSampleRate = 28;
@@ -140,12 +144,10 @@ namespace SensorSdk
         private const int OffInfoSampleCount = 48;
         private const int OffInfoStartTimeStamp = 52;
         private const int OffInfoDelay = 56;
-        private const int OffInfoStartTimeSec = 64;   // 8-aligned (pad at 60)
+        private const int OffInfoStartTimeSec = 64;
         private const int OffInfoDeviceName = 72;
 
         public string DeviceMac => ReadInfoString(0, i => i.deviceMac);
-        /// <summary>Device name from the cached DeviceInfo, stamped once
-        /// when the stream is created; empty when unknown.</summary>
         public string DeviceName => ReadInfoString(OffInfoDeviceName, i => i.deviceName);
         public SenDataType DataType => (SenDataType)ReadInfoInt32(OffInfoDataType, i => i.dataType);
         public int LostPackageCount => ReadInfoInt32(OffInfoLostPackageCount, i => i.lostPackageCount);
@@ -155,42 +157,27 @@ namespace SensorSdk
         public int SampleCount => ReadInfoInt32(OffInfoSampleCount, i => i.sampleCount);
         public int StartSampleIndex { get; }
 
-        /// <summary>The stream's StartTimeStamp snapshot taken when this view
-        /// was broadcast (session tag): a stream (re)start re-stamps the
-        /// stream's value, which instantly invalidates every view of the
-        /// previous session (IsDataValid compares the two). Steady-clock ms
-        /// low 32 bits live, the bin record timestamp on replay.</summary>
         public uint StartTimeStamp { get; }
 
-        /// <summary>First raw packet arrival minus StartTimeStamp; 0 until the
-        /// first packet of the current start.</summary>
         public uint Delay => (uint)ReadInfoInt32(OffInfoDelay, i => (int)i.delay);
 
-        /// <summary>Wall-clock Unix time in seconds (double) when the stream
-        /// was started; on replay restored from the bin record timestamps.
-        /// 0 = unknown. This is the anchor of every sample's
-        /// AbsTimeStampInSec.</summary>
         public double StartTimeSec => ReadInfoDouble(OffInfoStartTimeSec, i => i.startTimeSec);
 
-        /// <summary>
-        /// True while this instance borrows SDK memory (valid only inside
-        /// the DataReceived handler); false once owned via Clone().
-        /// </summary>
         public bool IsBorrowed => _ownedSamples == null;
 
-        private readonly IntPtr _infoPtr;        // borrowed per-stream Info (Zero when owned)
-        private SenDataInfo? _ownInfo;           // owned Info (set by Clone)
-        private readonly IntPtr _samplesPtr;     // borrowed backing (Zero when owned)
-        private readonly long _samplesBytes;     // sample-block byte length (view.samplesBytes / owned length)
-        private readonly byte[]? _ownedSamples;  // owned backing (null while borrowed)
-        private Sample[][]? _channelSamples;     // lazy compatibility cache
+        private readonly IntPtr _infoPtr;
+        private SenDataInfo? _ownInfo;
+        private readonly IntPtr _samplesPtr;
+        private readonly long _samplesBytes;
+        private readonly byte[]? _ownedSamples;
+        private Sample[][]? _channelSamples;
 
         internal SensorData(in SenDataView view)
         {
             StartSampleIndex = view.startSampleIndex;
             StartTimeStamp = view.startTimeStamp;
-            _infoPtr = view.info; // borrowed; same lifetime rules as samples
-            _samplesPtr = view.samples; // borrowed; dies when the callback returns
+            _infoPtr = view.info;
+            _samplesPtr = view.samples;
             _samplesBytes = (long)view.samplesBytes.ToUInt64();
         }
 
@@ -208,8 +195,6 @@ namespace SensorSdk
             _ownedSamples = owned;
         }
 
-        /* ---- Info reads (borrowed pointer or owned struct) ---- */
-
         private int ReadInfoInt32(int off, Func<SenDataInfo, int> fromOwned)
             => _ownInfo.HasValue ? fromOwned(_ownInfo.Value)
                : _infoPtr != IntPtr.Zero ? Marshal.ReadInt32(_infoPtr, off) : 0;
@@ -226,8 +211,6 @@ namespace SensorSdk
             => _ownInfo.HasValue ? fromOwned(_ownInfo.Value)
                : _infoPtr != IntPtr.Zero ? Int64BitsToDouble(Marshal.ReadInt64(_infoPtr, off)) : 0.0;
 
-        // NUL-terminated ASCII string at the given Info offset (borrowed
-        // pointer or owned struct); empty when there is no Info at all.
         private string ReadInfoString(int off, Func<SenDataInfo, string?> fromOwned)
             => _ownInfo.HasValue ? fromOwned(_ownInfo.Value) ?? string.Empty
                : _infoPtr != IntPtr.Zero
@@ -238,12 +221,6 @@ namespace SensorSdk
             => _ownedSamples != null ? _ownedSamples.Length > 0
                                      : _samplesPtr != IntPtr.Zero;
 
-        /// <summary>
-        /// Detaches the payload from native memory with ONE block copy
-        /// (sen_data_view_t.samplesBytes bytes); the returned instance is
-        /// safe to keep after the data callback returns. Cloning an already
-        /// owned instance copies managed memory only.
-        /// </summary>
         public SensorData Clone()
         {
             int n = checked((int)(_ownedSamples != null ? _ownedSamples.Length : _samplesBytes));
@@ -254,30 +231,8 @@ namespace SensorSdk
             return new SensorData(this, buf);
         }
 
-        /// <summary>
-        /// Compatibility accessor: the full [channel][sample] matrix of
-        /// managed Samples, built lazily on first access. Batch path, never
-        /// throws: slots failing the IsDataValid probe are filled with
-        /// default(Sample). Prefer the single-slot accessors
-        /// (GetData/GetChannelSample/...) - they do not materialize the
-        /// matrix.
-        /// </summary>
         public Sample[][] ChannelSamples => _channelSamples ??= BuildChannelSamples();
 
-        /* ---- single-slot accessors (no managed objects; index-range checked) ---- */
-
-        /// <summary>
-        /// Non-throwing probe (mirrors C++ SensorData::isDataValid): true when
-        /// slot (channel, sampleIndex) is readable — in range, a payload is
-        /// present, this view still belongs to the stream's current session
-        /// (its StartTimeStamp snapshot matches the stream's current value),
-        /// and the slot is not stale. The single-slot accessors do NOT repeat
-        /// this detection (they validate only the index ranges), so probe once
-        /// per batch first — staleness is batch-atomic, one (0, 0) probe
-        /// covers the whole batch. Note that channels masked out of
-        /// ChannelMask carry zeroed slots and therefore probe false. Both
-        /// indices default to 0: a bare IsDataValid() probes the batch head.
-        /// </summary>
         public bool IsDataValid(int channel = 0, int sampleIndex = 0)
         {
             if (channel < 0 || channel >= ChannelCount) return false;
@@ -288,21 +243,9 @@ namespace SensorSdk
             return ReadInt32(off + OffSampleIndex) == StartSampleIndex + sampleIndex;
         }
 
-        /// <summary>
-        /// True when channel <paramref name="channel"/> is enabled in
-        /// ChannelMask; false when channel is out of [0, 64).
-        /// </summary>
         public bool IsChannelEnabled(int channel)
             => channel >= 0 && channel < 64 && ((ChannelMask >> channel) & 1UL) != 0;
 
-        /// <summary>
-        /// Returns the full slot of (channel, sampleIndex). Reads straight
-        /// from the backing buffer; this is the only place a managed Sample
-        /// is constructed. Only the index ranges are validated — probe
-        /// <see cref="IsDataValid"/> first when the distinction between real
-        /// data and a stale/previous-session slot matters.
-        /// </summary>
-        /// <exception cref="ArgumentOutOfRangeException">channel/sampleIndex out of range.</exception>
         public Sample GetChannelSample(int channel, int sampleIndex)
         {
             int off = CheckedSlotOffset(channel, sampleIndex);
@@ -319,16 +262,9 @@ namespace SensorSdk
             };
         }
 
-        /// <inheritdoc cref="GetChannelSample" path="/summary|/exception"/>
         public float GetData(int channel, int sampleIndex)
             => ReadSingle(CheckedSlotOffset(channel, sampleIndex) + OffData);
 
-        /// <summary>
-        /// Sample timestamp in milliseconds, computed from the slot's
-        /// absolute index over the nominal rate (sampleIndex * 1000 /
-        /// SampleRate); 0 when the rate is unknown.
-        /// </summary>
-        /// <exception cref="ArgumentOutOfRangeException">channel/sampleIndex out of range.</exception>
         public int GetTimeStampInMs(int channel, int sampleIndex)
         {
             float rate = SampleRate;
@@ -337,46 +273,24 @@ namespace SensorSdk
                 : 0;
         }
 
-        /// <summary>
-        /// Absolute sample timestamp in LSL format (double seconds since the
-        /// Unix epoch), computed at decode time and stored in the slot. The
-        /// per-sample resolution is 1/SampleRate seconds at any rate —
-        /// including rates above 1000 Hz, where the int-ms GetTimeStampInMs
-        /// collapses. 0 when the anchor is unknown.
-        /// </summary>
-        /// <exception cref="ArgumentOutOfRangeException">channel/sampleIndex out of range.</exception>
         public double GetAbsTimeStampInSec(int channel, int sampleIndex)
             => ReadDouble(CheckedSlotOffset(channel, sampleIndex) + OffAbsTimeStamp);
 
-        /// <summary>
-        /// Returns the stored absolute sample index of (channel, sampleIndex)
-        /// (== StartSampleIndex + sampleIndex for every valid slot).
-        /// </summary>
-        /// <exception cref="ArgumentOutOfRangeException">channel/sampleIndex out of range.</exception>
         public int GetSampleIndex(int channel, int sampleIndex)
             => ReadInt32(CheckedSlotOffset(channel, sampleIndex) + OffSampleIndex);
 
-        /// <inheritdoc cref="GetChannelSample" path="/summary|/exception"/>
         public int GetRawData(int channel, int sampleIndex)
             => ReadInt32(CheckedSlotOffset(channel, sampleIndex) + OffRawData);
 
-        /// <inheritdoc cref="GetChannelSample" path="/summary|/exception"/>
         public float GetImpedance(int channel, int sampleIndex)
             => ReadSingle(CheckedSlotOffset(channel, sampleIndex) + OffImpedance);
 
-        /// <inheritdoc cref="GetChannelSample" path="/summary|/exception"/>
         public float GetSaturation(int channel, int sampleIndex)
             => ReadSingle(CheckedSlotOffset(channel, sampleIndex) + OffSaturation);
 
-        /// <inheritdoc cref="GetChannelSample" path="/summary|/exception"/>
         public bool IsLost(int channel, int sampleIndex)
             => ReadByte(CheckedSlotOffset(channel, sampleIndex) + OffIsLost) != 0;
 
-        // Range-checked byte offset of slot (channel, sampleIndex): every
-        // single-slot accessor funnels through here. Only the index ranges
-        // are validated — staleness/session detection lives in IsDataValid;
-        // probe it once per batch first, otherwise a stale or
-        // previous-session slot reads as garbage.
         private int CheckedSlotOffset(int channel, int sampleIndex)
         {
             if (channel < 0 || channel >= ChannelCount)
@@ -388,8 +302,6 @@ namespace SensorSdk
             return (channel * SampleCount + sampleIndex) * SampleSize;
         }
 
-        // One read path for both backings. The byte[] path relies on the
-        // host being little-endian (the ABI is fixed little-endian).
         private int ReadInt32(int off)
             => _ownedSamples != null
                 ? BitConverter.ToInt32(_ownedSamples, off)
@@ -405,9 +317,6 @@ namespace SensorSdk
                 ? BitConverter.ToDouble(_ownedSamples, off)
                 : Int64BitsToDouble(Marshal.ReadInt64(_samplesPtr, off));
 
-        // BitConverter.Int32BitsToSingle only exists on netstandard2.1 /
-        // netcoreapp3.0+; this explicit-layout union does the same bit
-        // reinterpretation on .NET Framework 4.8 and Unity/IL2CPP.
         private static float Int32BitsToSingle(int value)
             => new Int32SingleUnion { Int32 = value }.Single;
 
@@ -418,8 +327,6 @@ namespace SensorSdk
             [FieldOffset(0)] public float Single;
         }
 
-        // Same net48/IL2CPP portability reason as Int32BitsToSingle:
-        // BitConverter.Int64BitsToDouble does not exist there either.
         private static double Int64BitsToDouble(long value)
             => new Int64DoubleUnion { Int64 = value }.Double;
 
@@ -443,8 +350,6 @@ namespace SensorSdk
                 var col = new Sample[SampleCount];
                 for (int i = 0; i < SampleCount; i++)
                 {
-                    // Batch path: stale/masked/previous-session slots read as
-                    // default(Sample).
                     if (IsDataValid(ch, i)) col[i] = GetChannelSample(ch, i);
                 }
                 cols[ch] = col;
@@ -453,7 +358,6 @@ namespace SensorSdk
         }
     }
 
-    /// <summary>A scanned BLE device (managed copy of sen_ble_device_t).</summary>
     public struct BleDevice
     {
         public string Name;
@@ -471,7 +375,6 @@ namespace SensorSdk
         }
     }
 
-    /// <summary>Managed copy of sen_device_info_t (cached by init/fetchDeviceInfo).</summary>
     public sealed class DeviceInfo
     {
         public string DeviceName = string.Empty;
@@ -509,18 +412,15 @@ namespace SensorSdk
         public ushort Spo2SampleRate;
         public byte ImpeChannelCount;
         public ushort ImpeSampleRate;
-        /// <summary>Max sample rates from the device capability queries; 0 = not reported or not supported.</summary>
         public ushort EmgMaxSampleRate;
-        /// <inheritdoc cref="EmgMaxSampleRate"/>
         public ushort EegMaxSampleRate;
-        /// <inheritdoc cref="EmgMaxSampleRate"/>
         public ushort EcgMaxSampleRate;
-        /// <summary>Link connection interval in ms; 0 = unknown (the C++ BLE backends do not expose it).</summary>
         public double ConnectionIntervalMs;
-        /// <summary>Peripheral latency in events; -1 = unknown (0 is a legal value).</summary>
         public int PeripheralLatency;
-        /// <summary>Supervision timeout in ms; 0 = unknown.</summary>
         public int SupervisionTimeoutMs;
+        public string Backend = string.Empty;
+        public byte GestChannelCount;
+        public ushort GestSampleRate;
 
         internal static DeviceInfo FromNative(in SenDeviceInfo i)
         {
@@ -566,79 +466,114 @@ namespace SensorSdk
                 EcgMaxSampleRate = i.EcgMaxSampleRate,
                 ConnectionIntervalMs = i.ConnectionIntervalMs,
                 PeripheralLatency = i.PeripheralLatency,
-                SupervisionTimeoutMs = i.SupervisionTimeoutMs
+                SupervisionTimeoutMs = i.SupervisionTimeoutMs,
+                Backend = CapiString.FromBytes(i.backend),
+                GestChannelCount = i.GestChannelCount,
+                GestSampleRate = i.GestSampleRate
             };
         }
     }
 
-    /// <summary>Summary of a raw BLE bin capture (managed copy of sen_bin_file_info_t).</summary>
+    public sealed class BinSensorDataConfig
+    {
+        public double SampleRate;
+        public double K;
+        public ulong ChannelMask;
+        public SenDataType DataType;
+        public byte TypeIndex;
+        public byte ChannelCount;
+        public byte PackageIndexLength;
+        public byte ResolutionBits;
+        public byte ResolutionSigned;
+        public sbyte RawDataBias;
+        public ushort PackageSampleCount;
+        public ushort MinPackageSampleCount;
+
+        internal static BinSensorDataConfig FromNative(in SenBinSensorDataConfig c)
+        {
+            return new BinSensorDataConfig
+            {
+                SampleRate = c.sampleRate,
+                K = c.k,
+                ChannelMask = c.channelMask,
+                DataType = (SenDataType)c.dataType,
+                TypeIndex = c.typeIndex,
+                ChannelCount = c.channelCount,
+                PackageIndexLength = c.packageIndexLength,
+                ResolutionBits = c.resolutionBits,
+                ResolutionSigned = c.resolutionSigned,
+                RawDataBias = c.rawDataBias,
+                PackageSampleCount = c.packageSampleCount,
+                MinPackageSampleCount = c.minPackageSampleCount
+            };
+        }
+    }
+
     public sealed class BinFileInfo
     {
         public string Mac = string.Empty;
         public string DeviceName = string.Empty;
         public double DurationSec;
         public bool Valid;
-        /// <summary>
-        /// DeviceInfo decoded from the first CONFIG record of the capture;
-        /// all-zero/empty when the file has no decodable config.
-        /// </summary>
         public DeviceInfo DeviceInfo = new DeviceInfo();
+        public uint ConfigVersion;
+        public int ChipType;
+        public bool IsUniversalStream;
+        public bool IsNewEmg;
+        public bool IsContainQat6;
+        public byte PpgModel;
+        public long FeatureMap;
+        public long NotifyDataFlag;
+        public List<BinSensorDataConfig> SensorDatas = new List<BinSensorDataConfig>();
+        public ulong FirstDataTsMs;
+        public ulong LastDataTsMs;
 
         internal static BinFileInfo FromNative(in SenBinFileInfo i)
         {
-            return new BinFileInfo
+            var info = new BinFileInfo
             {
                 Mac = CapiString.FromBytes(i.mac),
                 DeviceName = CapiString.FromBytes(i.deviceName),
                 DurationSec = i.durationSec,
                 Valid = i.valid != 0,
-                DeviceInfo = SensorSdk.DeviceInfo.FromNative(in i.deviceInfo)
+                DeviceInfo = SensorSdk.DeviceInfo.FromNative(in i.deviceInfo),
+                ConfigVersion = i.ConfigVersion,
+                ChipType = i.chipType,
+                IsUniversalStream = i.isUniversalStream != 0,
+                IsNewEmg = i.isNewEmg != 0,
+                IsContainQat6 = i.isContainQat6 != 0,
+                PpgModel = i.ppgModel,
+                FeatureMap = i.featureMap,
+                NotifyDataFlag = i.notifyDataFlag,
+                FirstDataTsMs = i.firstDataTsMs,
+                LastDataTsMs = i.lastDataTsMs
             };
+            int count = (int)i.sensorDataCount;
+            SenBinSensorDataConfig[]? nativeDatas = i.sensorDatas;
+            if (nativeDatas != null)
+            {
+                if (count > nativeDatas.Length) count = nativeDatas.Length;
+                for (int n = 0; n < count; n++)
+                    info.SensorDatas.Add(BinSensorDataConfig.FromNative(in nativeDatas[n]));
+            }
+            return info;
         }
     }
 
-    /// <summary>
-    /// Per-device profile (Python SensorProfile parity). Handles are owned by
-    /// the SensorController; wrappers are cached per native handle.
-    /// Events fire on internal SDK threads.
-    /// </summary>
     public sealed class SensorProfile
     {
         internal IntPtr Handle { get; }
         private GCHandle _ctxHandle;
+        private DeviceInfo? _deviceInfoCache;
+        private BleDevice? _bleDeviceCache;
+        private int _powerCache = -1;
 
-        /// <summary>
-        /// All batches accumulated since the last callback, in one call.
-        /// The delivered SensorData objects BORROW SDK memory: their payload
-        /// is only valid until this handler returns. Call SensorData.Clone()
-        /// inside the handler to keep any batch.
-        /// </summary>
         public event Action<SensorProfile, List<SensorData>>? DataReceived;
         public event Action<SensorProfile, SenDeviceState>? StateChanged;
         public event Action<SensorProfile, string>? ErrorReceived;
         public event Action<SensorProfile, int>? PowerChanged;
-        /// <summary>
-        /// DeviceInfo field change push (aligned with the Python SDK 0.7.0
-        /// onDeviceInfoUpdate): fired after the cached DeviceInfo was updated
-        /// in place (e.g. SetParam "EEG_SAMPLE_RATE" rewrote the bound EEG/ECG
-        /// rates). The delivered DeviceInfo is a managed copy.
-        /// </summary>
         public event Action<SensorProfile, DeviceInfo>? DeviceInfoUpdated;
-        /// <summary>
-        /// Data stream on/off state change push: fired when the data stream
-        /// actually starts (a successful StartDataNotificationAsync, or the
-        /// data start of a bin replay) or stops (StopDataNotificationAsync,
-        /// link loss, replay end). Fires only on a real state change; the
-        /// argument is true while streaming.
-        /// </summary>
         public event Action<SensorProfile, bool>? DataTransferStateChanged;
-        /// <summary>
-        /// Gates session recovery after an auto reconnect. Answer through the
-        /// passed action, exactly once and from any thread: answer(true) takes
-        /// over the recovery yourself, answer(false) runs the SDK's default
-        /// init -> setParam replay -> stream restart flow. If no answer
-        /// arrives within 10 s the SDK runs the default recovery.
-        /// </summary>
         public Action<SensorProfile, bool, Action<bool>>? OnAutoReconnect { get; set; }
 
         internal SensorProfile(IntPtr handle)
@@ -668,19 +603,19 @@ namespace SensorSdk
         {
             get
             {
+                if (_bleDeviceCache.HasValue) return _bleDeviceCache.Value;
                 var d = new SenBleDevice();
                 Native.sen_profile_get_device(Handle, ref d);
-                return BleDevice.FromNative(in d);
+                _bleDeviceCache = BleDevice.FromNative(in d);
+                return _bleDeviceCache.Value;
             }
         }
 
         public SenDeviceState DeviceState => (SenDeviceState)Native.sen_profile_get_state(Handle);
-        /// <summary>True when the link is Ready (Python SDK 0.7.2 isReady parity).</summary>
         public bool IsReady => DeviceState == SenDeviceState.Ready;
         public bool HasInited => Native.sen_profile_has_init(Handle) != 0;
         public bool IsDataTransfering => Native.sen_profile_has_start_data_notification(Handle) != 0;
 
-        /// <summary>Connects; resolves with the final link result (Python asyncConnect parity).</summary>
         public Task<bool> ConnectAsync()
         {
             var op = new CompletionOp<bool>();
@@ -688,7 +623,6 @@ namespace SensorSdk
             return op.Task;
         }
 
-        /// <summary>Disconnects; resolves true once the link is torn down (Python asyncDisconnect parity).</summary>
         public Task<bool> DisconnectAsync()
         {
             var op = new CompletionOp<bool>();
@@ -696,8 +630,7 @@ namespace SensorSdk
             return op.Task;
         }
 
-        /// <summary>Initialize the device; resolves on success, throws SensorException on error.</summary>
-        public Task InitAsync(int packageSampleCount, int powerRefreshIntervalMs = 0, int timeoutMs = 10000)
+        public Task InitAsync(int packageSampleCount, int powerRefreshIntervalMs = 0, int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_init(Handle, packageSampleCount, timeoutMs,
@@ -705,68 +638,130 @@ namespace SensorSdk
             return op.Task;
         }
 
-        public Task StartDataNotificationAsync(int timeoutMs = 10000)
+        public Task StartDataNotificationAsync(int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_start_data(Handle, timeoutMs, NativeCallbacks.Completion, op.CtxPtr);
             return op.Task;
         }
 
-        public Task StopDataNotificationAsync(int timeoutMs = 10000)
+        public Task StopDataNotificationAsync(int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_stop_data(Handle, timeoutMs, NativeCallbacks.Completion, op.CtxPtr);
             return op.Task;
         }
 
-        /// <summary>Fresh battery query (unfiltered); resolves with the level in percent.</summary>
-        public Task<int> GetBatteryLevelAsync(int timeoutMs = 10000)
+        public async Task<int> GetBatteryLevelAsync(int timeoutMs = 0)
         {
             var op = new CompletionOp<int>();
             Native.sen_profile_get_battery_level(Handle, timeoutMs, NativeCallbacks.Battery, op.CtxPtr);
-            return op.Task;
+            int level = await op.Task.ConfigureAwait(false);
+            if (level >= 0) _powerCache = level;
+            return level;
         }
 
-        public Task<DeviceInfo> FetchDeviceInfoAsync(int timeoutMs = 10000)
+        public async Task<DeviceInfo> FetchDeviceInfoAsync(int timeoutMs = 0)
         {
             var op = new CompletionOp<DeviceInfo>();
             Native.sen_profile_fetch_device_info(Handle, timeoutMs, NativeCallbacks.Info, op.CtxPtr);
-            return op.Task;
+            var info = await op.Task.ConfigureAwait(false);
+            _deviceInfoCache = info;
+            return info;
         }
 
-        /// <summary>Cached DeviceInfo populated during init/fetchDeviceInfo; no GATT traffic.</summary>
-        public DeviceInfo GetDeviceInfo()
+        public DeviceInfo? GetDeviceInfo()
         {
+            if (_deviceInfoCache != null) return _deviceInfoCache;
             var info = SenDeviceInfo.Create();
             Native.sen_profile_get_device_info(Handle, ref info);
-            return DeviceInfo.FromNative(in info);
+            var outInfo = DeviceInfo.FromNative(in info);
+            if (outInfo.DeviceName.Length == 0 && outInfo.ModelName.Length == 0) return null;
+            _deviceInfoCache = outInfo;
+            return outInfo;
         }
 
-        /// <summary>Resolves with the SDK result string ("" on success, "ERROR: ..." on failure).</summary>
-        public Task<string> SetParamAsync(string key, string value, int timeoutMs = 10000)
+        public Task<string> SetParamAsync(string key, string value, int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_set_param(Handle, timeoutMs, key, value, NativeCallbacks.Param, op.CtxPtr);
             return op.Task;
         }
 
-        /// <summary>Resolves with the parameter value or "Error: ..." (Python parity).</summary>
-        public Task<string> GetParamAsync(string key, int timeoutMs = 10000)
+        public Task<string> GetParamAsync(string key, int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_get_param(Handle, timeoutMs, key, NativeCallbacks.Param, op.CtxPtr);
             return op.Task;
         }
 
-        /// <summary>Enables/disables session recovery after an auto reconnect (default on).</summary>
+        public bool Connect()
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(ConnectAsync(), 40000, false);
+        }
+
+        public bool Disconnect()
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(DisconnectAsync(), 25000, false);
+        }
+
+        public bool Init(int packageSampleCount, int powerRefreshIntervalMs = 0,
+            int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(
+                InitAsync(packageSampleCount, powerRefreshIntervalMs, timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public bool StartDataNotification(int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(StartDataNotificationAsync(timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public bool StopDataNotification(int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(StopDataNotificationAsync(timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public string SetParam(string key, string value, int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(SetParamAsync(key, value, timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public string GetParam(string key, int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(GetParamAsync(key, timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public int GetBatteryLevel()
+        {
+            if (_powerCache >= 0) return _powerCache;
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(GetBatteryLevelAsync(),
+                SensorController.AssumedCmdTimeoutMs + 15000, -1);
+        }
+
+        public DeviceInfo? FetchDeviceInfo(int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await<DeviceInfo>(FetchDeviceInfoAsync(timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000, null!);
+        }
+
         public void SetAutoReconnect(bool enabled)
             => Native.sen_profile_set_auto_reconnect(Handle, enabled ? 1 : 0);
 
-        /// <summary>
-        /// Writes an application log line (tag "App") into the SDK log for
-        /// this device. level is the first character, case-insensitive:
-        /// d/i/w/e; anything else is treated as "i". Never throws.
-        /// </summary>
         public void Log(string message, string level = "I")
         {
             try
@@ -775,11 +770,8 @@ namespace SensorSdk
             }
             catch
             {
-                // Logging must never surface an error to the caller.
             }
         }
-
-        /* ---- native callback entry points (SDK threads) ---- */
 
         internal void RaiseData(IntPtr views, int viewCount)
         {
@@ -791,51 +783,156 @@ namespace SensorSdk
             {
                 SenDataView view = Marshal.PtrToStructure<SenDataView>(
                     IntPtr.Add(views, i * viewSize));
-                // Lightweight borrowed view: metadata only, no sample copy.
                 batch.Add(new SensorData(in view));
             }
-            handler(this, batch);
+            foreach (Action<SensorProfile, List<SensorData>> h in
+                     handler.GetInvocationList())
+            {
+                try
+                {
+                    h(this, batch);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
+            }
         }
 
         internal void RaiseState(int newState)
-            => StateChanged?.Invoke(this, (SenDeviceState)newState);
+        {
+            if (newState == (int)SenDeviceState.Disconnected)
+            {
+                _deviceInfoCache = null;
+                _bleDeviceCache = null;
+                _powerCache = -1;
+            }
+            var handler = StateChanged;
+            if (handler == null) return;
+            foreach (Action<SensorProfile, SenDeviceState> h in
+                     handler.GetInvocationList())
+            {
+                try
+                {
+                    h(this, (SenDeviceState)newState);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
+            }
+        }
 
         internal void RaiseError(IntPtr errorMsg)
-            => ErrorReceived?.Invoke(this, CapiString.FromPtr(errorMsg));
+        {
+            var handler = ErrorReceived;
+            if (handler == null) return;
+            string msg = CapiString.FromPtr(errorMsg);
+            foreach (Action<SensorProfile, string> h in handler.GetInvocationList())
+            {
+                try
+                {
+                    h(this, msg);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
+            }
+        }
 
         internal void RaisePower(int power)
-            => PowerChanged?.Invoke(this, power);
+        {
+            _powerCache = power;
+            var handler = PowerChanged;
+            if (handler == null) return;
+            foreach (Action<SensorProfile, int> h in handler.GetInvocationList())
+            {
+                try
+                {
+                    h(this, power);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
+            }
+        }
 
         internal void RaiseAutoReconnect(int hasLastSession, IntPtr answer, IntPtr answerCtx)
         {
-            var answerFn = Marshal.GetDelegateForFunctionPointer<SenAutoReconnectAnswerCb>(answer);
-            var handler = OnAutoReconnect;
-            if (handler == null)
+            SenAutoReconnectAnswerCb? answerFn = null;
+            bool answered = false;
+            void AnswerOnce(bool handled)
             {
-                answerFn(answerCtx, 0);
-                return;
+                if (answered || answerFn == null) return;
+                answered = true;
+                try
+                {
+                    answerFn(answerCtx, handled ? 1 : 0);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
             }
-            handler(this, hasLastSession != 0, handled => answerFn(answerCtx, handled ? 1 : 0));
+            try
+            {
+                answerFn = Marshal.GetDelegateForFunctionPointer<SenAutoReconnectAnswerCb>(answer);
+                var handler = OnAutoReconnect;
+                if (handler == null)
+                {
+                    AnswerOnce(false);
+                    return;
+                }
+                handler(this, hasLastSession != 0, AnswerOnce);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+                AnswerOnce(false);
+            }
         }
 
         internal void RaiseDeviceInfoUpdate(IntPtr info)
         {
-            var handler = DeviceInfoUpdated;
-            if (handler == null || info == IntPtr.Zero) return;
+            if (info == IntPtr.Zero) return;
             SenDeviceInfo native = Marshal.PtrToStructure<SenDeviceInfo>(info);
-            handler(this, DeviceInfo.FromNative(in native));
+            var deviceInfo = DeviceInfo.FromNative(in native);
+            _deviceInfoCache = deviceInfo;
+            var handler = DeviceInfoUpdated;
+            if (handler == null) return;
+            foreach (Action<SensorProfile, DeviceInfo> h in handler.GetInvocationList())
+            {
+                try
+                {
+                    h(this, deviceInfo);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
+            }
         }
 
         internal void RaiseDataTransferState(int isTransferring)
-            => DataTransferStateChanged?.Invoke(this, isTransferring != 0);
+        {
+            var handler = DataTransferStateChanged;
+            if (handler == null) return;
+            foreach (Action<SensorProfile, bool> h in handler.GetInvocationList())
+            {
+                try
+                {
+                    h(this, isTransferring != 0);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
+            }
+        }
     }
 
-    /// <summary>
-    /// Static delegate instances passed to the SDK. They must live for the
-    /// process lifetime - the SDK stores the function pointers.
-    /// ctx is a GCHandle to the target object (SensorProfile / SensorController /
-    /// a per-call CompletionOp), recovered with GCHandle.FromIntPtr.
-    /// </summary>
     internal static class NativeCallbacks
     {
         internal static readonly SenDataCb Data = OnData;
@@ -846,6 +943,7 @@ namespace SensorSdk
         internal static readonly SenDeviceInfoUpdateCb DeviceInfoUpdate = OnDeviceInfoUpdate;
         internal static readonly SenDataTransferStateCb DataTransferState = OnDataTransferState;
         internal static readonly SenScanResultCb ScanResult = OnScanResult;
+        internal static readonly SenScanResultCb ScanOnceResult = OnScanOnceResult;
         internal static readonly SenEnableChangedCb EnableChanged = OnEnableChanged;
         internal static readonly SenCompletionCb Completion = OnCompletion;
         internal static readonly SenCompletionCb BoolCompletion = OnBoolCompletion;
@@ -859,79 +957,230 @@ namespace SensorSdk
 
         [MonoPInvokeCallback(typeof(SenDataCb))]
         private static void OnData(IntPtr ctx, IntPtr profile, IntPtr views, UIntPtr viewCount)
-            => ProfileFromCtx(ctx).RaiseData(views, checked((int)viewCount));
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                ProfileFromCtx(ctx).RaiseData(views, checked((int)viewCount));
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenStateCb))]
         private static void OnState(IntPtr ctx, IntPtr profile, int newState)
-            => ProfileFromCtx(ctx).RaiseState(newState);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                ProfileFromCtx(ctx).RaiseState(newState);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenErrorCb))]
         private static void OnError(IntPtr ctx, IntPtr profile, IntPtr errorMsg)
-            => ProfileFromCtx(ctx).RaiseError(errorMsg);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                ProfileFromCtx(ctx).RaiseError(errorMsg);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenPowerCb))]
         private static void OnPower(IntPtr ctx, IntPtr profile, int power)
-            => ProfileFromCtx(ctx).RaisePower(power);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                ProfileFromCtx(ctx).RaisePower(power);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenAutoReconnectCb))]
         private static void OnAutoReconnect(IntPtr ctx, IntPtr profile, int hasLastSession,
                                             IntPtr answer, IntPtr answerCtx)
-            => ProfileFromCtx(ctx).RaiseAutoReconnect(hasLastSession, answer, answerCtx);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                ProfileFromCtx(ctx).RaiseAutoReconnect(hasLastSession, answer, answerCtx);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenDeviceInfoUpdateCb))]
         private static void OnDeviceInfoUpdate(IntPtr ctx, IntPtr profile, IntPtr info)
-            => ProfileFromCtx(ctx).RaiseDeviceInfoUpdate(info);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                ProfileFromCtx(ctx).RaiseDeviceInfoUpdate(info);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenDataTransferStateCb))]
         private static void OnDataTransferState(IntPtr ctx, IntPtr profile, int isTransferring)
-            => ProfileFromCtx(ctx).RaiseDataTransferState(isTransferring);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                ProfileFromCtx(ctx).RaiseDataTransferState(isTransferring);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenScanResultCb))]
         private static void OnScanResult(IntPtr ctx, IntPtr devices, UIntPtr count)
-            => ((SensorController)GCHandle.FromIntPtr(ctx).Target!)
-                .RaiseScanResult(devices, checked((int)count));
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                ((SensorController)GCHandle.FromIntPtr(ctx).Target!)
+                    .RaiseScanResult(devices, checked((int)count));
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
+
+        [MonoPInvokeCallback(typeof(SenScanResultCb))]
+        private static void OnScanOnceResult(IntPtr ctx, IntPtr devices, UIntPtr count)
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            ScanOnceOp.Complete(ctx, devices, checked((int)count));
+        }
 
         [MonoPInvokeCallback(typeof(SenEnableChangedCb))]
         private static void OnEnableChanged(IntPtr ctx, int enabled)
-            => ((SensorController)GCHandle.FromIntPtr(ctx).Target!).RaiseEnableChanged(enabled != 0);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                ((SensorController)GCHandle.FromIntPtr(ctx).Target!).RaiseEnableChanged(enabled != 0);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenCompletionCb))]
         private static void OnCompletion(IntPtr ctx, int result, IntPtr errorMsg)
-            => CompletionOp<string>.Complete(ctx, errorMsg,
-                msg => msg);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                CompletionOp<string>.Complete(ctx, result, errorMsg, msg => msg);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenCompletionCb))]
         private static void OnBoolCompletion(IntPtr ctx, int result, IntPtr errorMsg)
-            => CompletionOp<bool>.Complete(ctx, errorMsg, _ => result != 0);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                CompletionOp<bool>.Complete(ctx, errorMsg, _ => result != 0);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenParamCb))]
         private static void OnParam(IntPtr ctx, IntPtr result, IntPtr errorMsg)
-            => CompletionOp<string>.Complete(ctx, errorMsg,
-                _ => CapiString.FromPtr(result));
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                CompletionOp<string>.Complete(ctx, errorMsg,
+                    _ => CapiString.FromPtr(result));
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenBatteryCb))]
         private static void OnBattery(IntPtr ctx, int result, IntPtr errorMsg)
-            => CompletionOp<int>.Complete(ctx, errorMsg, _ => result);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                CompletionOp<int>.Complete(ctx, errorMsg, _ => result);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenInfoCb))]
         private static void OnInfo(IntPtr ctx, IntPtr info, IntPtr errorMsg)
-            => CompletionOp<DeviceInfo>.Complete(ctx, errorMsg, _ =>
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
             {
-                SenDeviceInfo native = Marshal.PtrToStructure<SenDeviceInfo>(info);
-                return DeviceInfo.FromNative(in native);
-            });
+                CompletionOp<DeviceInfo>.Complete(ctx, errorMsg, _ =>
+                {
+                    SenDeviceInfo native = Marshal.PtrToStructure<SenDeviceInfo>(info);
+                    return DeviceInfo.FromNative(in native);
+                });
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
 
         [MonoPInvokeCallback(typeof(SenMultiResultCb))]
         private static void OnMultiResult(
             IntPtr ctx, IntPtr macs, IntPtr oks, IntPtr errors, UIntPtr count)
-            => MultiResultOp.Complete(ctx, macs, oks, errors, count);
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            try
+            {
+                MultiResultOp.Complete(ctx, macs, oks, errors, count);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
     }
 
-    /// <summary>
-    /// One in-flight callback-async operation. The GCHandle is the ctx passed
-    /// to the SDK and is freed exactly once, when the completion callback
-    /// fires. A non-empty errorMsg completes the task with a SensorException.
-    /// </summary>
     internal sealed class CompletionOp<T>
     {
         private readonly TaskCompletionSource<T> _tcs =
@@ -944,19 +1193,73 @@ namespace SensorSdk
 
         internal static void Complete(IntPtr ctx, IntPtr errorMsg, Func<string, T> map)
         {
-            var op = (CompletionOp<T>)GCHandle.FromIntPtr(ctx).Target!;
-            string err = CapiString.FromPtr(errorMsg);
-            op._handle.Free();
-            if (err.Length == 0) op._tcs.TrySetResult(map(err));
-            else op._tcs.TrySetException(new SensorException(err));
+            Complete(ctx, 1, errorMsg, map);
+        }
+
+        internal static void Complete(IntPtr ctx, int result, IntPtr errorMsg, Func<string, T> map)
+        {
+            CompletionOp<T>? op = null;
+            try
+            {
+                op = (CompletionOp<T>)GCHandle.FromIntPtr(ctx).Target!;
+                string err = CapiString.FromPtr(errorMsg);
+                if (result != 0 && err.Length == 0) op._tcs.TrySetResult(map(err));
+                else op._tcs.TrySetException(new SensorException(err));
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+                if (op != null) op._tcs.TrySetException(ex);
+            }
+            finally
+            {
+                if (op != null && op._handle.IsAllocated) op._handle.Free();
+            }
         }
     }
 
-    /// <summary>
-    /// One in-flight synchronized multi-device start/stop operation. Same
-    /// rooting rules as CompletionOp: the GCHandle is the ctx passed to the
-    /// SDK and is freed exactly once, when the result callback fires.
-    /// </summary>
+    internal sealed class ScanOnceOp
+    {
+        private readonly TaskCompletionSource<List<BleDevice>> _tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly GCHandle _handle;
+
+        internal ScanOnceOp()
+        {
+            _handle = GCHandle.Alloc(this);
+        }
+
+        internal IntPtr CtxPtr => GCHandle.ToIntPtr(_handle);
+        internal Task<List<BleDevice>> Task => _tcs.Task;
+
+        internal static void Complete(IntPtr ctx, IntPtr devices, int count)
+        {
+            ScanOnceOp? op = null;
+            try
+            {
+                op = (ScanOnceOp)GCHandle.FromIntPtr(ctx).Target!;
+                var list = new List<BleDevice>(count);
+                int devSize = Marshal.SizeOf<SenBleDevice>();
+                for (int i = 0; i < count; i++)
+                {
+                    SenBleDevice d = Marshal.PtrToStructure<SenBleDevice>(
+                        IntPtr.Add(devices, i * devSize));
+                    list.Add(BleDevice.FromNative(in d));
+                }
+                op._tcs.TrySetResult(list);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+                if (op != null) op._tcs.TrySetException(ex);
+            }
+            finally
+            {
+                if (op != null && op._handle.IsAllocated) op._handle.Free();
+            }
+        }
+    }
+
     internal sealed class MultiResultOp
     {
         private readonly TaskCompletionSource<Dictionary<string, bool>> _tcs =
@@ -976,39 +1279,46 @@ namespace SensorSdk
         internal static void Complete(
             IntPtr ctx, IntPtr macs, IntPtr oks, IntPtr errors, UIntPtr count)
         {
-            var op = (MultiResultOp)GCHandle.FromIntPtr(ctx).Target!;
-            op._handle.Free();
-            int n = checked((int)count);
-            var result = new Dictionary<string, bool>(n);
-            for (int i = 0; i < n; i++)
+            MultiResultOp? op = null;
+            try
             {
-                string mac = CapiString.FromPtr(Marshal.ReadIntPtr(macs, i * IntPtr.Size));
-                bool ok = Marshal.ReadInt32(oks, i * sizeof(int)) != 0;
-                result[mac] = ok;
-                if (op._errors != null)
+                op = (MultiResultOp)GCHandle.FromIntPtr(ctx).Target!;
+                int n = checked((int)count);
+                var result = new Dictionary<string, bool>(n);
+                for (int i = 0; i < n; i++)
                 {
-                    string err = errors == IntPtr.Zero
-                        ? string.Empty
-                        : CapiString.FromPtr(Marshal.ReadIntPtr(errors, i * IntPtr.Size));
-                    op._errors[mac] = err;
+                    string mac = CapiString.FromPtr(Marshal.ReadIntPtr(macs, i * IntPtr.Size));
+                    bool ok = Marshal.ReadInt32(oks, i * sizeof(int)) != 0;
+                    result[mac] = ok;
+                    if (op._errors != null)
+                    {
+                        string err = errors == IntPtr.Zero
+                            ? string.Empty
+                            : CapiString.FromPtr(Marshal.ReadIntPtr(errors, i * IntPtr.Size));
+                        op._errors[mac] = err;
+                    }
                 }
+                op._tcs.TrySetResult(result);
             }
-            op._tcs.TrySetResult(result);
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+                if (op != null) op._tcs.TrySetException(ex);
+            }
+            finally
+            {
+                if (op != null && op._handle.IsAllocated) op._handle.Free();
+            }
         }
     }
 
-    /// <summary>
-    /// Process-wide scan controller (Python SensorController parity). Use the
-    /// <see cref="Instance"/> singleton; Dispose/TearDown destroys the native
-    /// controller (invalidating every profile handle) and terminates the
-    /// whole SDK. Call once at application shutdown; idempotent.
-    /// Events fire on internal SDK threads.
-    /// </summary>
     public sealed class SensorController : IDisposable
     {
         private static readonly Lazy<SensorController> _instance =
             new(() => new SensorController());
         public static SensorController Instance => _instance.Value;
+
+        internal static int AssumedCmdTimeoutMs = 10000;
 
         private readonly IntPtr _handle;
         private readonly GCHandle _ctxHandle;
@@ -1041,11 +1351,6 @@ namespace SensorSdk
 
         public void Dispose() => TearDown();
 
-        /// <summary>
-        /// Destroys the native controller (every SensorProfile handle dies
-        /// with it) and terminates the whole SDK: all scans and connections
-        /// stop. Call once at application shutdown; repeated calls are safe.
-        /// </summary>
         public void TearDown()
         {
             if (_disposed) return;
@@ -1069,53 +1374,21 @@ namespace SensorSdk
         public bool StopScan()
             => Native.sen_controller_stop_scan(_handle) != 0;
 
-        /// <summary>
-        /// Scans for periodInMs and returns the deduped device list (Python
-        /// asyncScan parity): every scan round's matches are merged by MAC,
-        /// later rounds refresh the entry in place.
-        /// </summary>
         public async Task<List<BleDevice>> ScanAsync(int periodInMs)
         {
-            var found = new Dictionary<string, BleDevice>();
-            void Handler(List<BleDevice> devices)
-            {
-                lock (found)
-                {
-                    foreach (BleDevice d in devices)
-                        found[d.Mac] = d;
-                }
-            }
-            DeviceFound += Handler;
-            try
-            {
-                StartScan(periodInMs);
-                await Task.Delay(periodInMs).ConfigureAwait(false);
-                StopScan();
-            }
-            finally
-            {
-                DeviceFound -= Handler;
-            }
-            lock (found)
-            {
-                return new List<BleDevice>(found.Values);
-            }
+            var op = new ScanOnceOp();
+            Native.sen_controller_scan_once(_handle, periodInMs,
+                NativeCallbacks.ScanOnceResult, op.CtxPtr);
+            return await op.Task.ConfigureAwait(false);
         }
 
-        public void SetDebugEnabled(bool enabled)
-            => Native.sen_controller_set_debug_enabled(_handle, enabled ? 1 : 0);
+        public List<BleDevice> Scan(int periodInMs)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(ScanAsync(periodInMs), periodInMs + 15000,
+                new List<BleDevice>());
+        }
 
-        public void SetDataLogEnabled(bool enabled)
-            => Native.sen_controller_set_data_log_enabled(_handle, enabled ? 1 : 0);
-
-        public void SetLogPath(bool enabled, string path = "")
-            => Native.sen_controller_set_log_path(_handle, enabled ? 1 : 0, path);
-
-        /// <summary>
-        /// Writes an application log line (tag "App") into the SDK log.
-        /// level is the first character, case-insensitive: d/i/w/e; anything
-        /// else is treated as "i". Never throws.
-        /// </summary>
         public void Log(string message, string level = "I")
         {
             try
@@ -1124,17 +1397,9 @@ namespace SensorSdk
             }
             catch
             {
-                // Logging must never surface an error to the caller.
             }
         }
 
-        /// <summary>
-        /// iOS/Android: call when the app moves to the background. Writes a
-        /// "suspend" event marker into every open bin capture and flushes each
-        /// capture plus the SDK log queue to disk, so an app killed while
-        /// suspended loses as little as possible. Does not stop scanning,
-        /// streaming, or any connection. Never throws.
-        /// </summary>
         public void OnSuspend()
         {
             try
@@ -1143,21 +1408,35 @@ namespace SensorSdk
             }
             catch
             {
-                // Best-effort durability hook; never surfaces an error.
             }
         }
 
-        /// <summary>
-        /// Returns the profile for a device (creating and registering it when
-        /// the MAC is unknown, so it also works for unscanned devices).
-        /// </summary>
-        public SensorProfile RequireSensor(BleDevice device) => RequireSensor(device.Mac);
+        public SensorProfile? RequireSensor(BleDevice device) => RequireSensor(device.Mac);
 
-        public SensorProfile RequireSensor(string mac)
+        public SensorProfile? RequireSensor(string mac)
         {
+            if (!IsValidMac(mac)) return null;
             IntPtr p = Native.sen_controller_require_sensor(_handle, mac);
             if (p == IntPtr.Zero) throw new SensorException("require_sensor failed");
             return WrapProfile(p);
+        }
+
+        private static bool IsValidMac(string mac)
+        {
+            if (mac == null || mac.Length != 17) return false;
+            for (int i = 0; i < mac.Length; i++)
+            {
+                char c = mac[i];
+                if ((i + 1) % 3 == 0)
+                {
+                    if (c != ':') return false;
+                }
+                else if (!Uri.IsHexDigit(c))
+                {
+                    return false;
+                }
+            }
+            return true;
         }
 
         public SensorProfile? GetSensor(string mac)
@@ -1199,21 +1478,8 @@ namespace SensorSdk
             }
         }
 
-        /* ---- synchronized multi-device stream start/stop ---- */
-
-        /// <summary>
-        /// Starts the data stream on several devices with their start writes
-        /// released together, so the streams begin as simultaneously as the
-        /// link allows (Python multiStartDataNotification parity). When the
-        /// spread of the first-packet delays exceeds maxDelayDispersionMs the
-        /// round is torn down and retried, up to maxAttempts rounds. Resolves
-        /// with mac -> ok for every participant (invalid or not-ready devices
-        /// get their own false entry); when errors is supplied it is filled
-        /// with the per-device result string ("" on success) before the task
-        /// completes. Participants that are already streaming are restarted.
-        /// </summary>
         public Task<Dictionary<string, bool>> MultiStartDataNotificationAsync(
-            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 30000,
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 0,
             int maxDelayDispersionMs = 5, int maxAttempts = 3,
             Dictionary<string, string>? errors = null)
         {
@@ -1225,16 +1491,8 @@ namespace SensorSdk
             return op.Task;
         }
 
-        /// <summary>
-        /// Stops the data stream on several devices with their stop writes
-        /// released together (Python multiStopDataNotification parity).
-        /// Devices that are not streaming report success immediately.
-        /// Resolves with mac -> ok for every participant; when errors is
-        /// supplied it is filled with the per-device result string ("" on
-        /// success) before the task completes.
-        /// </summary>
         public Task<Dictionary<string, bool>> MultiStopDataNotificationAsync(
-            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 10000,
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 0,
             Dictionary<string, string>? errors = null)
         {
             IntPtr[] handles = CollectHandles(sensors);
@@ -1243,6 +1501,28 @@ namespace SensorSdk
                 (UIntPtr)handles.Length, timeoutMs, NativeCallbacks.MultiResult,
                 op.CtxPtr);
             return op.Task;
+        }
+
+        public Dictionary<string, bool> MultiStartDataNotification(
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 0,
+            int maxDelayDispersionMs = 5, int maxAttempts = 3,
+            Dictionary<string, string>? errors = null)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(
+                MultiStartDataNotificationAsync(sensors, timeoutMs,
+                    maxDelayDispersionMs, maxAttempts, errors),
+                (timeoutMs > 0 ? timeoutMs : 60000) + 45000, new Dictionary<string, bool>());
+        }
+
+        public Dictionary<string, bool> MultiStopDataNotification(
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 0,
+            Dictionary<string, string>? errors = null)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(
+                MultiStopDataNotificationAsync(sensors, timeoutMs, errors),
+                timeoutMs + 45000, new Dictionary<string, bool>());
         }
 
         private static IntPtr[] CollectHandles(IReadOnlyList<SensorProfile> sensors)
@@ -1259,8 +1539,6 @@ namespace SensorSdk
             return handles;
         }
 
-        /* ---- bin capture inspection and offline replay ---- */
-
         public BinFileInfo? GetBinFileInfo(string path)
         {
             var info = SenBinFileInfo.Create();
@@ -1268,34 +1546,30 @@ namespace SensorSdk
             return ok != 0 ? BinFileInfo.FromNative(in info) : null;
         }
 
-        /// <summary>
-        /// Replays a bin capture through the normal parse pipeline on a
-        /// background thread; attach events to the returned profile.
-        /// </summary>
         public SensorProfile? ReplayBinFile(string path, string deviceMac,
-            bool realtime = true, uint timeoutMs = 30000)
+            bool realtime = true, uint timeoutMs = 0)
         {
             IntPtr p = Native.sen_controller_replay_bin_file(
                 _handle, path, deviceMac ?? string.Empty, realtime ? 1 : 0, timeoutMs);
             return p == IntPtr.Zero ? null : WrapProfile(p);
         }
 
-        /// <summary>
-        /// Synchronized multi-bin replay: every (paths[i], macs[i]) capture
-        /// replays on one shared clock aligned by record timestamps (the
-        /// earliest record in the group is t=0, so concurrently recorded
-        /// captures keep their original relative offsets). Pausing/resuming
-        /// any member freezes/resumes the whole group; StopBinReplay stays
-        /// per device. The returned array is input-order aligned; a null
-        /// entry marks a member that failed validation.
-        /// </summary>
-        public SensorProfile?[] MultiReplayBinFile(string[] paths, string[] macs,
-            bool realtime = true, uint timeoutMs = 30000)
+        public SensorProfile?[] MultiReplayBinFile(string[] paths,
+            IReadOnlyList<SensorProfile> sensors,
+            bool realtime = true, uint timeoutMs = 0)
         {
             if (paths == null) throw new ArgumentNullException(nameof(paths));
-            if (macs == null) throw new ArgumentNullException(nameof(macs));
-            if (paths.Length != macs.Length)
-                throw new ArgumentException("paths and macs must have the same length");
+            if (sensors == null) throw new ArgumentNullException(nameof(sensors));
+            if (paths.Length != sensors.Count)
+                throw new ArgumentException("paths and sensors must have the same length");
+            var macs = new string[paths.Length];
+            for (int i = 0; i < paths.Length; i++)
+            {
+                if (sensors[i] == null)
+                    throw new ArgumentException(
+                        "sensors must not contain null entries", nameof(sensors));
+                macs[i] = sensors[i].Device.Mac;
+            }
             var outProfiles = new IntPtr[paths.Length];
             Native.sen_controller_multi_replay_bin_file(
                 _handle, paths, macs, (UIntPtr)paths.Length,
@@ -1327,16 +1601,22 @@ namespace SensorSdk
                 return true;
             });
 
-        /// <summary>
-        /// Offline full-speed parse of a bin capture into CSV. Blocks the
-        /// caller; returns the csv path on success or an "Error: ..." string.
-        /// </summary>
-        public string ParseBinToCsv(string binPath, string csvPath)
-            => CapiString.ReadOutString((buf, len) =>
-            {
-                Native.sen_controller_parse_bin_to_csv(_handle, binPath, csvPath, buf, len);
-                return true;
-            });
+        public Task<string> ParseBinToCsvAsync(string binPath, string csvPath)
+        {
+            var op = new CompletionOp<string>();
+            Native.sen_controller_parse_bin_to_csv(_handle, binPath, csvPath,
+                NativeCallbacks.Param, op.CtxPtr);
+            return op.Task;
+        }
+
+        public string ParseBinToCsv(string binPath, string? csvPath = null)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            string csv = string.IsNullOrEmpty(csvPath)
+                ? System.IO.Path.ChangeExtension(binPath, ".csv")
+                : csvPath!;
+            return SyncWait.AwaitString(ParseBinToCsvAsync(binPath, csv), 320000);
+        }
 
         public string GetVersion()
             => CapiString.ReadOutString((buf, len) =>
@@ -1345,13 +1625,53 @@ namespace SensorSdk
                 return true;
             }, capacity: 256);
 
-        /// <summary>
-        /// SEN_CAPI_VERSION of the loaded native library, so the caller can
-        /// detect a binding/library mismatch at runtime.
-        /// </summary>
-        public static uint CapiVersion => Native.sen_capi_version();
+        public Task<string> GetParamAsync(string key)
+        {
+            var op = new CompletionOp<string>();
+            Native.sen_controller_get_param(_handle, key, NativeCallbacks.Param, op.CtxPtr);
+            return op.Task;
+        }
 
-        /* ---- native callback entry points (SDK threads) ---- */
+        public async Task<string> SetParamAsync(string key, string value)
+        {
+            var op = new CompletionOp<string>();
+            Native.sen_controller_set_param(_handle, key, value,
+                NativeCallbacks.Param, op.CtxPtr);
+            string result = await op.Task.ConfigureAwait(false);
+            if (key == "CMD_TIMEOUT_MS" && result == "OK" &&
+                int.TryParse(value, out int ms) && ms > 0)
+            {
+                AssumedCmdTimeoutMs = ms;
+            }
+            return result;
+        }
+
+        public Task<string> CheckSetupDongleAsync()
+        {
+            var op = new CompletionOp<string>();
+            Native.sen_controller_check_setup_dongle(_handle, NativeCallbacks.Param, op.CtxPtr);
+            return op.Task;
+        }
+
+        public string GetParam(string key)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(GetParamAsync(key), 20000);
+        }
+
+        public string SetParam(string key, string value)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(SetParamAsync(key, value), 20000);
+        }
+
+        public string CheckSetupDongle()
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(CheckSetupDongleAsync(), 320000);
+        }
+
+        public static uint CapiVersion => Native.sen_capi_version();
 
         internal void RaiseScanResult(IntPtr devices, int count)
         {
@@ -1365,10 +1685,34 @@ namespace SensorSdk
                     IntPtr.Add(devices, i * devSize));
                 list.Add(BleDevice.FromNative(in d));
             }
-            handler(list);
+            foreach (Action<List<BleDevice>> h in handler.GetInvocationList())
+            {
+                try
+                {
+                    h(list);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
+            }
         }
 
         internal void RaiseEnableChanged(bool enabled)
-            => EnableChanged?.Invoke(enabled);
+        {
+            var handler = EnableChanged;
+            if (handler == null) return;
+            foreach (Action<bool> h in handler.GetInvocationList())
+            {
+                try
+                {
+                    h(enabled);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
+            }
+        }
     }
 }

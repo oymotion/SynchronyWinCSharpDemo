@@ -1,21 +1,3 @@
-// P/Invoke declarations for the handle-based flat C API in include/sen_capi.h
-// (44 sen_* functions). Every struct mirrors the C layout exactly
-// (LayoutKind.Sequential, default pack); structSize-versioned structs must be
-// constructed with structSize = Marshal.SizeOf<T>() before being passed in.
-//
-// Marshaling notes:
-// - Fixed-size char arrays are ByValArray byte[] (NUL-terminated ASCII);
-//   decode with the CapiString helper in Sensor.cs. SenDataInfo is the
-//   exception: its deviceMac/deviceName are pure ASCII and marshal as
-//   ByValTStr string directly.
-// - sen_data_view_t.samples is an IntPtr into SDK-owned memory that is only
-//   valid for the duration of the data callback - read or copy (clone) it
-//   there, never store the pointer for later use.
-// - size_t maps to UIntPtr. All entry points are Cdecl.
-// - Callback tables are passed as structs of raw function pointers (IntPtr)
-//   built from static delegates via Marshal.GetFunctionPointerForDelegate, so
-//   the delegates can never be collected while the SDK holds them.
-
 using System;
 using System.Runtime.InteropServices;
 
@@ -51,16 +33,9 @@ namespace SensorSdk.Capi
         Ppg = 24
     }
 
-    // ABI mirror of sen_sample_t (fixed 40-byte little-endian layout, see
-    // sen_capi.h). Kept for layout documentation; the data path does NOT
-    // marshal samples one by one - SensorData reads fields straight from the
-    // native pointer / cloned byte[] via the fixed offsets.
     [StructLayout(LayoutKind.Sequential)]
     public struct SenSample
     {
-        // LSL-style absolute timestamp: stream-start wall clock (Unix
-        // seconds) + first-packet delay + sampleIndex/sampleRate, computed
-        // at decode time; 0 when the anchor is unknown.
         public double absTimeStampInSec;
         public int channelIndex;
         public int sampleIndex;
@@ -78,13 +53,9 @@ namespace SensorSdk.Capi
         public byte reserved6;
     }
 
-    // Broadcast metadata shared by every view of one stream (mirrors
-    // sen_data_info_t; the info pointer in SenDataView borrows stream-owned
-    // storage, same lifetime rules as the samples pointer).
     [StructLayout(LayoutKind.Sequential)]
     public struct SenDataInfo
     {
-        // NUL-terminated ASCII; marshaled as a fixed string (ByValTStr).
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 18)]
         public string deviceMac;
         public int dataType;
@@ -93,36 +64,20 @@ namespace SensorSdk.Capi
         public int channelCount;
         public ulong channelMask;
         public int sampleCount;
-        // Stream-start stamp: steady-clock ms live (low 32 bits), the bin
-        // record ts on replay; re-stamped on every (re)start.
         public uint startTimeStamp;
         public uint delay;
-        // Wall-clock Unix seconds (double) at stream start; on replay
-        // restored from the bin record timestamps (0 = unknown).
         public double startTimeSec;
-        // Device name from the cached DeviceInfo, stamped once when the
-        // stream is created; empty when unknown.
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
         public string deviceName;
     }
 
-    // Layout invariant (from sen_capi.h): samples are packed
-    // [channel][sample] with per-channel stride == sampleCount, so
-    // samples[channelIndex * sampleCount + sampleIndex] is the slot of
-    // (channelIndex, sampleIndex). Channels masked out of channelMask carry
-    // zeroed slots. A slot whose sampleIndex != startSampleIndex + sampleIndex
-    // is stale and must be skipped by consumers; a view whose startTimeStamp
-    // no longer matches the stream's current info.startTimeStamp belongs to a
-    // previous session and is stale as a whole.
     [StructLayout(LayoutKind.Sequential)]
     public struct SenDataView
     {
         public int startSampleIndex;
-        public uint startTimeStamp;   // snapshot of the stream's Info.startTimeStamp at broadcast time
-        public IntPtr info;    // borrowed sen_data_info_t, stream-owned storage
-        public IntPtr samples; // borrowed, callback scope only
-        // Byte size of the samples block (channelCount * sampleCount * 40);
-        // 0 when samples is null.
+        public uint startTimeStamp;
+        public IntPtr info;
+        public IntPtr samples;
         public UIntPtr samplesBytes;
     }
 
@@ -136,7 +91,6 @@ namespace SensorSdk.Capi
         public short rssi;
     }
 
-    // Mirror of sen_device_info_t; structSize-versioned for forward growth.
     [StructLayout(LayoutKind.Sequential)]
     public struct SenDeviceInfo
     {
@@ -183,12 +137,13 @@ namespace SensorSdk.Capi
         public ushort EmgMaxSampleRate;
         public ushort EegMaxSampleRate;
         public ushort EcgMaxSampleRate;
-        // Link connection parameters (aligned with the Python SDK 0.7.0
-        // DeviceInfo); the C++ BLE backends do not expose them, so they
-        // always report the unknown values.
-        public double ConnectionIntervalMs;  // 0 = unknown
-        public int PeripheralLatency;        // -1 = unknown (0 is a legal value)
-        public int SupervisionTimeoutMs;     // 0 = unknown
+        public double ConnectionIntervalMs;
+        public int PeripheralLatency;
+        public int SupervisionTimeoutMs;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] backend;
+        public byte GestChannelCount;
+        public ushort GestSampleRate;
 
         public static SenDeviceInfo Create()
         {
@@ -196,6 +151,23 @@ namespace SensorSdk.Capi
             info.structSize = (uint)Marshal.SizeOf<SenDeviceInfo>();
             return info;
         }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SenBinSensorDataConfig
+    {
+        public double sampleRate;
+        public double k;
+        public ulong channelMask;
+        public int dataType;
+        public byte typeIndex;
+        public byte channelCount;
+        public byte packageIndexLength;
+        public byte resolutionBits;
+        public byte resolutionSigned;
+        public sbyte rawDataBias;
+        public ushort packageSampleCount;
+        public ushort minPackageSampleCount;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -210,10 +182,20 @@ namespace SensorSdk.Capi
         public byte valid;
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 7)]
         public byte[] reserved;
-        // DeviceInfo from the first CONFIG record; zeroed when the file has
-        // no decodable config (or when a caller's structSize predates this
-        // field).
         public SenDeviceInfo deviceInfo;
+        public uint ConfigVersion;
+        public int chipType;
+        public byte isUniversalStream;
+        public byte isNewEmg;
+        public byte isContainQat6;
+        public byte ppgModel;
+        public long featureMap;
+        public long notifyDataFlag;
+        public uint sensorDataCount;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 14)]
+        public SenBinSensorDataConfig[] sensorDatas;
+        public ulong firstDataTsMs;
+        public ulong lastDataTsMs;
 
         public static SenBinFileInfo Create()
         {
@@ -222,8 +204,6 @@ namespace SensorSdk.Capi
             return info;
         }
     }
-
-    /* ---- callback types (Cdecl, raw IntPtr args to stay allocation-free) -- */
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenScanResultCb(IntPtr ctx, IntPtr devices, UIntPtr count);
@@ -238,28 +218,16 @@ namespace SensorSdk.Capi
     internal delegate void SenErrorCb(IntPtr ctx, IntPtr profile, IntPtr errorMsg);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenPowerCb(IntPtr ctx, IntPtr profile, int power);
-    // Answer callback for SenAutoReconnectCb: call it exactly once, from any
-    // thread, with non-zero to take over session recovery yourself, zero for
-    // the SDK's default init -> setParam replay -> stream restart flow. If no
-    // answer arrives within 10 s the SDK runs the default recovery.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenAutoReconnectAnswerCb(IntPtr answerCtx, int handled);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenAutoReconnectCb(IntPtr ctx, IntPtr profile, int hasLastSession,
                                               IntPtr answer, IntPtr answerCtx);
-    // DeviceInfo field change push (aligned with the Python SDK 0.7.0
-    // onDeviceInfoUpdate): fired after the cached DeviceInfo was updated in
-    // place (e.g. setParam "EEG_SAMPLE_RATE" rewrote the bound EEG/ECG rates).
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenDeviceInfoUpdateCb(IntPtr ctx, IntPtr profile, IntPtr info);
-    // Data stream on/off state change push: fired when the data stream
-    // actually starts (successful sen_profile_start_data, replay data start)
-    // or stops (sen_profile_stop_data, link loss, replay end), only on a real
-    // change. isTransferring: 1 = streaming, 0 = stopped.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenDataTransferStateCb(IntPtr ctx, IntPtr profile, int isTransferring);
 
-    // Callback tables: structSize first, then raw function pointers.
     [StructLayout(LayoutKind.Sequential)]
     internal struct SenProfileCbs
     {
@@ -281,7 +249,6 @@ namespace SensorSdk.Capi
         public IntPtr onEnableChanged;
     }
 
-    // Per-operation completions. errorMsg is empty (not NULL) on success.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenCompletionCb(IntPtr ctx, int result, IntPtr errorMsg);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -291,10 +258,6 @@ namespace SensorSdk.Capi
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenInfoCb(IntPtr ctx, IntPtr info, IntPtr errorMsg);
 
-    // Synchronized multi-device start/stop result (sen_multi_result_cb):
-    // macs/oks/errors are parallel borrowed arrays of count entries
-    // (char* / int / char*), valid for the callback scope only; the error
-    // strings are empty on success.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenMultiResultCb(
         IntPtr ctx, IntPtr macs, IntPtr oks, IntPtr errors, UIntPtr count);
@@ -302,17 +265,13 @@ namespace SensorSdk.Capi
     internal static class Native
     {
 #if UNITY_IOS && !UNITY_EDITOR
-        // iOS statically links the SDK into the Unity binary.
         private const string Dll = "__Internal";
 #else
         private const string Dll = "sensor";
 #endif
         private const CallingConvention Cc = CallingConvention.Cdecl;
 
-        // Mirror of SEN_CAPI_VERSION in sen_capi.h; bump in sync with the header.
-        internal const uint ExpectedCapiVersion = 10;
-
-        /* ---- controller ---- */
+        internal const uint ExpectedCapiVersion = 20;
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_terminate();
@@ -343,15 +302,7 @@ namespace SensorSdk.Capi
         internal static extern int sen_controller_stop_scan(IntPtr ctrl);
 
         [DllImport(Dll, CallingConvention = Cc)]
-        internal static extern void sen_controller_set_debug_enabled(IntPtr ctrl, int enabled);
-
-        [DllImport(Dll, CallingConvention = Cc)]
-        internal static extern void sen_controller_set_data_log_enabled(IntPtr ctrl, int enabled);
-
-        [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
-        internal static extern void sen_controller_set_log_path(
-            IntPtr ctrl, int enabled,
-            [MarshalAs(UnmanagedType.LPStr)] string path);
+        internal static extern void sen_controller_scan_once(IntPtr ctrl, int periodInMS, SenScanResultCb cb, IntPtr ctx);
 
         [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
         internal static extern void sen_controller_log(
@@ -361,6 +312,10 @@ namespace SensorSdk.Capi
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_controller_on_suspend(IntPtr ctrl);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        internal static extern void sen_controller_check_setup_dongle(
+            IntPtr ctrl, SenParamCb cb, IntPtr ctx);
 
         [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
         internal static extern IntPtr sen_controller_require_sensor(
@@ -418,14 +373,23 @@ namespace SensorSdk.Capi
             IntPtr ctrl,
             [MarshalAs(UnmanagedType.LPStr)] string binPath,
             [MarshalAs(UnmanagedType.LPStr)] string csvPath,
-            IntPtr buf, UIntPtr len);
+            SenParamCb cb, IntPtr ctx);
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_controller_get_version(
             IntPtr ctrl, IntPtr buf, UIntPtr len);
 
-        // Synchronized multi-device stream start/stop: cb fires exactly once
-        // with the per-device results (see SenMultiResultCb).
+        [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
+        internal static extern void sen_controller_get_param(
+            IntPtr ctrl, [MarshalAs(UnmanagedType.LPStr)] string key,
+            SenParamCb cb, IntPtr ctx);
+
+        [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
+        internal static extern void sen_controller_set_param(
+            IntPtr ctrl, [MarshalAs(UnmanagedType.LPStr)] string key,
+            [MarshalAs(UnmanagedType.LPStr)] string value,
+            SenParamCb cb, IntPtr ctx);
+
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_controller_multi_start_data(
             IntPtr ctrl, IntPtr[] profiles, UIntPtr count,
@@ -436,8 +400,6 @@ namespace SensorSdk.Capi
         internal static extern void sen_controller_multi_stop_data(
             IntPtr ctrl, IntPtr[] profiles, UIntPtr count,
             int timeoutMs, SenMultiResultCb cb, IntPtr ctx);
-
-        /* ---- profile ---- */
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_profile_set_callbacks(
@@ -450,9 +412,6 @@ namespace SensorSdk.Capi
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern int sen_profile_get_state(IntPtr profile);
 
-        // Callback-async (Python asyncConnect/asyncDisconnect parity): cb may be
-        // null (fire-and-forget); a non-null cb fires exactly once with the
-        // final result and an empty errorMsg on success.
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_profile_connect(IntPtr profile, SenCompletionCb cb, IntPtr ctx);
 
@@ -515,11 +474,6 @@ namespace SensorSdk.Capi
 }
 
 #if !UNITY_5_3_OR_NEWER
-// Compile-time stub of UnityEngine's AOT.MonoPInvokeCallbackAttribute so the
-// reverse-P/Invoke callback markers in Sensor.cs compile outside Unity. Unity
-// always defines UNITY_5_3_OR_NEWER, so Unity builds use the real attribute
-// (UnityEngine.CoreModule, namespace AOT). It is a marker only: IL2CPP reverse
-// P/Invoke works for static methods regardless, the attribute documents intent.
 namespace AOT
 {
     [AttributeUsage(AttributeTargets.Method)]

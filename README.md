@@ -198,7 +198,7 @@ sensorProfile.DataReceived += (SensorProfile sensor, List<SensorData> dataList) 
 sensorProfile.DeviceInfoUpdated += (SensorProfile sensor, DeviceInfo info) =>
 {
     // the cached DeviceInfo was patched in place (link parameters reported
-    // after connect, EEG_SAMPLE_RATE applied, replay config switch, ...)
+    // after connect, *_SAMPLE_RATE applied, replay config switch, ...)
 };
 
 sensorProfile.DataTransferStateChanged += (SensorProfile sensor, bool isTransferring) =>
@@ -465,14 +465,8 @@ await sensorProfile.SetParamAsync("NTF_MAG_ANGLE", "ON");
 await sensorProfile.SetParamAsync("NTF_PPG", "ON");
 await sensorProfile.SetParamAsync("NTF_PPG_RAW", "ON");   // alias of NTF_PPG
 await sensorProfile.SetParamAsync("NTF_SPO2", "ON");
-await sensorProfile.SetParamAsync("NTF_GFORCE_EULER", "ON");
-await sensorProfile.SetParamAsync("NTF_GFORCE_QUAT", "ON");
-await sensorProfile.SetParamAsync("NTF_GFORCE_ACC", "ON");
-await sensorProfile.SetParamAsync("NTF_GFORCE_GYRO", "ON");
-// NTF_IMU is the master switch of the four NTF_GFORCE_* streams: toggling it
-// updates all four, and toggling any of the four updates the aggregated
-// NTF_IMU state. On legacy EMG devices NTF_GEST and NTF_EMG are mutually
-// exclusive.
+// NTF_IMU switches all four IMU streams (ACC/GYRO/EULER/QUAT) together.
+// On legacy EMG devices NTF_GEST and NTF_EMG are mutually exclusive.
 
 // Firmware filter toggles
 await sensorProfile.SetParamAsync("FILTER_50HZ", "ON");   // 50Hz notch
@@ -486,6 +480,12 @@ await sensorProfile.SetParamAsync("EEG_SAMPLE_RATE", "500");
 // getParam("EEG_SAMPLE_RATE_LIST")); an unsupported value returns
 // "Error: unsupported sample rate ...".
 
+// EMG / IMU / PPG sample rates (same capability-list validation; each key
+// is settable only on devices whose capability query reported options)
+await sensorProfile.SetParamAsync("EMG_SAMPLE_RATE", "1000");
+await sensorProfile.SetParamAsync("IMU_SAMPLE_RATE", "200");
+await sensorProfile.SetParamAsync("PPG_SAMPLE_RATE", "200");
+
 // NeuCir remote control (NeuCir devices only)
 await sensorProfile.SetParamAsync("NEUCIR_SET_MODE", "APP_REMOTE");
 await sensorProfile.SetParamAsync("NEUCIR_APP_CONTROL", "OPEN");   // OPEN / CLOSE / STOP
@@ -494,10 +494,15 @@ await sensorProfile.SetParamAsync("NEUCIR_APP_CONTROL", "OPEN");   // OPEN / CLO
 await sensorProfile.SetParamAsync("DEBUG_BLE_DATA_PATH", "True");
 // export the session's raw BLE capture: "True" exports
 // {DeviceName}_data_YYYYMMDD_HHMMSS.bin into the SDK log directory (see
-// SetLogPath), or pass an absolute .bin path; "False" / "" disables export.
+// the LOG_PATH controller parameter), or pass an absolute .bin path;
+// "False" / "" disables export.
 await sensorProfile.SetParamAsync("DEBUG_LOG_PATH", "True");
 // enable this profile's log file ({DeviceName}_log_YYYYMMDD_HHMMSS.txt in
 // the SDK log directory), or pass an absolute path; "False" / "" disables.
+
+// Flush this device's pending bin capture and SDK log to disk; the value
+// is ignored
+await sensorProfile.SetParamAsync("FLUSH_BLE_DATA", "");
 ```
 
 ### getParam method
@@ -516,6 +521,9 @@ result = await sensorProfile.GetParamAsync("NTF");
 
 result = await sensorProfile.GetParamAsync("EEG_SAMPLE_RATE");       // e.g. "250"
 result = await sensorProfile.GetParamAsync("EEG_SAMPLE_RATE_LIST");  // e.g. "250|500"
+// Same for EMG_SAMPLE_RATE(_LIST), IMU_SAMPLE_RATE(_LIST) and
+// PPG_SAMPLE_RATE(_LIST); the list answers "Error: Not supported" when the
+// device never reported rate options.
 ```
 
 ## Bin file recording and replay
@@ -606,20 +614,20 @@ without a config record yields `raw` rows only.
 
 ## Logging controls
 
-`SetLogPath` sets the SDK log **directory** (it must be a directory). All
-default file outputs live in it: the controller log, the default per-profile
-logs (`DEBUG_LOG_PATH=True`) and the default bin exports
-(`DEBUG_BLE_DATA_PATH=True`).
+The `LOG_PATH` controller parameter sets the SDK log **directory** (it must
+be a directory). All default file outputs live in it: the controller log,
+the default per-profile logs (`DEBUG_LOG_PATH=True`) and the default bin
+exports (`DEBUG_BLE_DATA_PATH=True`).
 
 ```csharp
-controller.SetDebugEnabled(true);
+controller.SetParam("DEBUG_ENABLED", "True");
 // enable SDK debug logs; creates the controller log
 // (sensor_controller_log_YYYYMMDD_HHMMSS.txt) in the log directory.
-// SetDebugEnabled(false) closes it and drops all file output.
+// "False" closes it and drops all file output.
 
-controller.SetLogPath(true, "d:/temp/sdklogs");
-// set the log directory (created if missing). SetLogPath(false) disables
-// file output; SetLogPath(true) resets to the default
+controller.SetParam("LOG_PATH", "d:/temp/sdklogs");
+// set the log directory (created if missing). "False" disables
+// file output; "True" resets to the default
 // (Documents/sensorsdklog).
 ```
 
@@ -635,7 +643,7 @@ sensorProfile.Log("User toggled filter 50Hz", "I"); // profile log when enabled,
 ```
 
 `level` is judged by its first character, case-insensitive `d` / `i` / `w` /
-`e` (anything else is `Info`); `d` follows the `SetDebugEnabled` switch.
+`e` (anything else is `Info`); `d` follows the `DEBUG_ENABLED` switch.
 Entries are tagged `[App]` in the log files. Never throws.
 
 ---
@@ -658,13 +666,17 @@ Entries are tagged `[App]` in the log files. Never throws.
   unconditionally.
 - **Left column**: 3D quaternion cube, 2D waveform of the selected type
   (ACC / GYRO / Quat / Euler) with per-channel labels, an FFT spectrum strip
-  (recomputed every 500 ms on a worker thread), and a real-time values box.
+  below it (recomputed every 200 ms on a worker thread), and a real-time
+  values box.
   The **Live Filter** combo band-passes the bio waveforms (Off / delta /
   theta / alpha / beta / gamma).
-- **Bio panel** (right, 8 stacked waveforms): auto-selected by device
+- **Bio panel** (right, 8 stacked rows): auto-selected by device
   capability — EMG channels, or paged EEG channels plus ECG/BRTH slots
   (Prev/Next), or the PPG fixed plot set (EEG fp1/fp2 + PPG red/ir + SpO2
-  spo2/heart_rate). Impedance side texts appear on the EMG/EEG plots.
+  spo2/heart_rate). Each EMG/EEG channel row is a 50/50 split with the
+  channel's FFT spectrum on the left (same shared worker, following EEG
+  paging and the channel's curve color); ECG/BRTH/unused rows and the PPG
+  mode stay full-width. Impedance side texts appear on the EMG/EEG plots while the IMPE switch is on (hidden when the device has no impedance capability or the switch is off).
 - **Device page**: status line (per-type nominal rates), actual-rates line
   (measured Hz once per second, plus stream-start wall clock and
   first-packet delay), Model / HW / FW / Link / MTU / Power labels (battery
@@ -672,10 +684,14 @@ Entries are tagged `[App]` in the log files. Never throws.
 - **Settings**: Packet Loss Stats, Gesture box, Enable SDK Debug Log /
   Enable Debug Bin Data (the session's logs and .bin exports land in one
   timestamped subdir of `Documents/sensorsdklog`), Data Notification
-  switches (EEG/EMG/GESTURE/PPG/SpO2/IMU, capability-gated by the device
+  switches (EEG/IMPE/EMG/GESTURE/PPG/SpO2/IMU/Angle, capability-gated by the device
   info), Filter switches (50Hz/60Hz/HPF/LPF), EEG Sample Rate radios
-  (250/500/1000/2000 Hz, capability-gated by `EEG_SAMPLE_RATE_LIST`;
-  unsupported rates and the whole group on EEG-less devices are hidden).
+  (250/500/1000/2000 Hz, capability-gated by `EEG_SAMPLE_RATE_LIST`),
+  EMG Sample Rate radios (500/1000 Hz, `EMG_SAMPLE_RATE_LIST`), IMU Sample
+  Rate radios (50/100/200/250/400/500/1000/2000 Hz, `IMU_SAMPLE_RATE_LIST`)
+  and PPG Sample Rate radios (50/100/200/400/800/1000/1600/3200 Hz,
+  `PPG_SAMPLE_RATE_LIST`); a group is hidden entirely when its option list
+  is empty, and unsupported rates inside a group are hidden too.
 - **Replay Bin File**: replays a `.bin` capture through the normal parse
   pipeline (realtime; Pause/Resume/Stop). The header row right of the SDK
   version label carries a **Multi Start/Stop** toggle button (synchronized

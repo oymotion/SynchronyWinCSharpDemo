@@ -20,6 +20,7 @@ public sealed class SpectrumControl : UserControl
     private List<float[]> _mags = new();
     private IReadOnlyList<string> _labels = [];
     private string _placeholder = "Not connected";
+    private int _colorIndex = -1;
 
     public SpectrumControl()
     {
@@ -54,6 +55,14 @@ public sealed class SpectrumControl : UserControl
     public void SetPlaceholder(string text)
     {
         _placeholder = text;
+        Invalidate();
+    }
+
+    // colorIndex >= 0 pins the curve color (single-channel rows); -1 colors
+    // each curve by its row index.
+    public void SetColorIndex(int colorIndex)
+    {
+        _colorIndex = colorIndex;
         Invalidate();
     }
 
@@ -98,7 +107,8 @@ public sealed class SpectrumControl : UserControl
         for (int ch = 0; ch < _mags.Count; ch++)
         {
             float[] row = _mags[ch];
-            Color color = WaveformControl.ChannelColors[ch % WaveformControl.ChannelColors.Length];
+            int colorIdx = _colorIndex >= 0 ? _colorIndex : ch;
+            Color color = WaveformControl.ChannelColors[colorIdx % WaveformControl.ChannelColors.Length];
             using (var builder = new CanvasPathBuilder(sender))
             {
                 builder.BeginFigure(new Vector2(px, py + ph));

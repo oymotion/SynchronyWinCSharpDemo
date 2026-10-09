@@ -94,7 +94,6 @@ public sealed class DeviceState
         Profile = p;
         Name = p.Device.Name;
         Mac = p.Device.Mac;
-        RateWindowStartMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     }
 
     public SensorProfile Profile { get; }
@@ -114,6 +113,7 @@ public sealed class DeviceState
     public readonly RingBuffer Eeg = new();
     public readonly RingBuffer Ecg = new();
     public readonly RingBuffer Brth = new();
+    public readonly RingBuffer MagAngle = new();
     public readonly RingBuffer Ppg = new();
     public readonly RingBuffer Spo2 = new();
     public readonly RingBuffer Quat = new();
@@ -134,13 +134,15 @@ public sealed class DeviceState
 
     // Actual-rate accounting
     public readonly object RateMutex = new();
-    public readonly Dictionary<int, long> RateCounts = new();
+    public readonly Dictionary<int, long> RateTotalCounts = new();
+    public readonly Dictionary<int, long> RateStreamStartMs = new();
+    public readonly Dictionary<int, uint> RateStreamTags = new();
     public readonly Dictionary<int, double> ActualRates = new();
     public readonly Dictionary<int, float> NominalRates = new();
     public readonly Dictionary<int, int> NominalChannels = new();
-    public long RateWindowStartMs;
-    // Stream-start wall clock and first-packet delay
-    public double StreamStartTimeSec;
+    public long RateLastDataMs;
+    // Stream-start wall clock per data type and first-packet delay
+    public readonly Dictionary<int, double> StreamStartTimeSecs = new();
     public uint StreamDelayMs;
 
     public readonly Dictionary<string, int> LostCounts = new();
@@ -153,6 +155,12 @@ public sealed class DeviceState
     // Cached sample-rate control state
     public List<int> SampleRateOptions = new();
     public int SampleRateCurrent;
+    public List<int> EmgSampleRateOptions = new();
+    public int EmgSampleRateCurrent;
+    public List<int> ImuSampleRateOptions = new();
+    public int ImuSampleRateCurrent;
+    public List<int> PpgSampleRateOptions = new();
+    public int PpgSampleRateCurrent;
 
     public BioKind GetBioKind()
     {
@@ -160,7 +168,8 @@ public sealed class DeviceState
             return BioKind.PPG;
         if (Info.EEGChannelCount > 0 || Eeg.Allocated)
             return BioKind.EEG;
-        if (Info.EMGChannelCount > 0 || Emg.Allocated)
+        if (Info.EMGChannelCount > 0 || Info.MagAngleChannelCount > 0
+            || Emg.Allocated || MagAngle.Allocated)
             return BioKind.EMG;
         return BioKind.None;
     }
@@ -182,14 +191,14 @@ public sealed class DeviceState
                         valid++;
                 }
                 if (valid > 0)
-                    RateCounts[(int)data.DataType] = RateCounts.GetValueOrDefault((int)data.DataType) + valid;
+                    NoteRateSamples((int)data.DataType, data.StartTimeStamp, valid);
             }
             if (data.SampleRate > 0)
                 NominalRates[(int)data.DataType] = data.SampleRate;
             if (data.ChannelCount > 0)
                 NominalChannels[(int)data.DataType] = data.ChannelCount;
             if (data.StartTimeSec > 0)
-                StreamStartTimeSec = data.StartTimeSec;
+                StreamStartTimeSecs[(int)data.DataType] = data.StartTimeSec;
             if (data.Delay > 0)
                 StreamDelayMs = data.Delay;
         }
@@ -236,6 +245,8 @@ public sealed class DeviceState
                 target = Ecg; impedance = EcgImpedance; seconds = BioBufferSeconds; break;
             case SenDataType.Brth:
                 target = Brth; impedance = BrthImpedance; seconds = BioBufferSeconds; break;
+            case SenDataType.MagAngle:
+                target = MagAngle; seconds = BioBufferSeconds; break;
         }
         if (target == null)
             return;
@@ -297,10 +308,12 @@ public sealed class DeviceState
                         valid++;
                 }
                 if (valid > 0)
-                    RateCounts[(int)type] = RateCounts.GetValueOrDefault((int)type) + valid;
+                    NoteRateSamples((int)type, data.StartTimeStamp, valid);
                 if (data.SampleRate > 0)
                     NominalRates[(int)type] = data.SampleRate;
                 NominalChannels[(int)type] = count;
+                if (data.StartTimeSec > 0)
+                    StreamStartTimeSecs[(int)type] = data.StartTimeSec;
             }
 
             RingBuffer target = type switch
@@ -354,7 +367,7 @@ public sealed class DeviceState
         lock (BufMutex)
         {
             Acc.Clear(); Gyro.Clear(); Emg.Clear(); Eeg.Clear(); Ecg.Clear();
-            Brth.Clear(); Ppg.Clear(); Spo2.Clear(); Quat.Clear(); Euler.Clear();
+            Brth.Clear(); MagAngle.Clear(); Ppg.Clear(); Spo2.Clear(); Quat.Clear(); Euler.Clear();
             Fill(EmgImpedance, -1.0f);
             Fill(EegImpedance, -1.0f);
             Fill(EcgImpedance, -1.0f);
@@ -369,19 +382,39 @@ public sealed class DeviceState
             list[i] = v;
     }
 
+    private void NoteRateSamples(int type, uint sessionTag, long valid)
+    {
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (RateStreamTags.GetValueOrDefault(type) != sessionTag)
+        {
+            RateStreamTags[type] = sessionTag;
+            RateTotalCounts[type] = 0;
+            RateStreamStartMs[type] = now;
+        }
+        RateTotalCounts[type] = RateTotalCounts.GetValueOrDefault(type) + valid;
+        RateLastDataMs = now;
+    }
+
     public void UpdateActualRates()
     {
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         lock (RateMutex)
         {
-            double elapsed = (now - RateWindowStartMs) / 1000.0;
-            if (elapsed <= 0.0)
+            if (RateLastDataMs > 0 && now - RateLastDataMs > 2000)
+            {
+                ActualRates.Clear();
+                RateTotalCounts.Clear();
+                RateStreamStartMs.Clear();
+                RateStreamTags.Clear();
+                RateLastDataMs = 0;
                 return;
+            }
             ActualRates.Clear();
-            foreach (var kv in RateCounts)
-                ActualRates[kv.Key] = kv.Value / elapsed;
-            RateCounts.Clear();
-            RateWindowStartMs = now;
+            foreach (var kv in RateTotalCounts)
+            {
+                double elapsed = (now - RateStreamStartMs.GetValueOrDefault(kv.Key, now)) / 1000.0;
+                ActualRates[kv.Key] = kv.Value / Math.Max(elapsed, 0.001);
+            }
         }
     }
 
@@ -400,6 +433,7 @@ public sealed class DeviceState
         ((int)SenDataType.Ecg, "ECG"),
         ((int)SenDataType.Brth, "BRTH"),
         ((int)SenDataType.Gest, "GEST"),
+        ((int)SenDataType.MagAngle, "Angle"),
     ];
 
     public string BuildStatusText()
@@ -432,13 +466,14 @@ public sealed class DeviceState
                 if (!ActualRates.TryGetValue(type, out double actual))
                     continue;
                 float nominal = NominalRates.GetValueOrDefault(type);
-                entries.Add($"{label} {actual:F1} / {(nominal > 0 ? nominal.ToString() : "--")}Hz");
-            }
-            if (StreamStartTimeSec > 0)
-            {
-                var dt = DateTimeOffset.FromUnixTimeMilliseconds((long)(StreamStartTimeSec * 1000.0))
-                                       .ToLocalTime();
-                entries.Add("start " + dt.ToString("yyyy-MM-dd HH:mm:ss.fff"));
+                string entry = $"{label} {actual:F1} / {(nominal > 0 ? nominal.ToString() : "--")}Hz";
+                if (StreamStartTimeSecs.TryGetValue(type, out double startSec) && startSec > 0)
+                {
+                    var dt = DateTimeOffset.FromUnixTimeMilliseconds((long)(startSec * 1000.0))
+                                           .ToLocalTime();
+                    entry += " (start " + dt.ToString("HH:mm:ss.fff") + ")";
+                }
+                entries.Add(entry);
             }
             if (StreamDelayMs > 0)
                 entries.Add($"delay {StreamDelayMs}ms");
@@ -455,12 +490,12 @@ public sealed class DeviceState
         SenDataType.Quaternion => "QUAT",
         SenDataType.Gest => "GEST",
         SenDataType.Emg => "EMG",
-        SenDataType.MagAngle => "MAG",
+        SenDataType.MagAngle => "Angle",
         SenDataType.Eeg => "EEG",
         SenDataType.Ppg => "PPG",
         SenDataType.Spo2 => "SPO2",
         SenDataType.Ecg => "ECG",
-        SenDataType.Impedance => "IMP",
+        SenDataType.Impedance => "IMPE",
         SenDataType.Imu => "IMU",
         SenDataType.Ads => "ADS",
         SenDataType.Brth => "BRTH",

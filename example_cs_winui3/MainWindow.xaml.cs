@@ -20,19 +20,23 @@ public sealed partial class MainWindow : Window
     private const int PackageCount = 32;
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
-    private const int FftUpdateIntervalMs = 500;
-    private const string DemoVersion = "0.1.21";
+    private const int FftUpdateIntervalMs = 200;
+    private const string DemoVersion = "0.1.37";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
 
-    private static readonly string[] NtfKeys = ["NTF_EEG", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU"];
+    private static readonly string[] NtfKeys = ["NTF_EEG", "NTF_IMPEDANCE", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU", "NTF_MAG_ANGLE"];
     private static readonly string[] FilterKeys = ["FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF"];
     private static readonly int[] SampleRateCandidates = [250, 500, 1000, 2000];
+    private static readonly int[] EmgSampleRateCandidates = [500, 1000];
+    private static readonly int[] ImuSampleRateCandidates = [50, 100, 200, 250, 400, 500, 1000, 2000];
+    private static readonly int[] PpgSampleRateCandidates = [50, 100, 200, 400, 800, 1000, 1600, 3200];
     private static readonly Dictionary<string, string> NtfLabels = new()
     {
-        ["NTF_EEG"] = "EEG", ["NTF_EMG"] = "EMG", ["NTF_GEST"] = "GESTURE",
-        ["NTF_PPG"] = "PPG", ["NTF_SPO2"] = "SpO2", ["NTF_IMU"] = "IMU",
+        ["NTF_EEG"] = "EEG", ["NTF_IMPEDANCE"] = "IMPE", ["NTF_EMG"] = "EMG",
+        ["NTF_GEST"] = "GESTURE", ["NTF_PPG"] = "PPG", ["NTF_SPO2"] = "SpO2",
+        ["NTF_IMU"] = "IMU", ["NTF_MAG_ANGLE"] = "Angle",
     };
     private static readonly Dictionary<string, string> FilterLabels = new()
     {
@@ -64,6 +68,7 @@ public sealed partial class MainWindow : Window
     private readonly Dictionary<string, string> _lastDataPaths = new();
     private bool _debugLogEnabled = true;
     private bool _binDataEnabled = true;
+    private bool _dongleDebugEnabled = true;
 
     private bool _updatingControls;
     private bool _shuttingDown;
@@ -94,13 +99,48 @@ public sealed partial class MainWindow : Window
     private float[] _fftFreqs = [];
     private List<float[]> _fftMags = new();
     private long _fftLastSubmitMs;
+    private Task? _fftTask;
+    private Task? _analyzeTask;
+
+    // Per-row spectra in the bio rows (EMG/EEG channel rows, the EEG page's
+    // ECG row, the PPG page's EEG/PPG rows): shares the FFT worker above;
+    // _bioFftRows is the current row -> ring binding (Buffer == null = no
+    // spectrum on that row) and each row computes with its own buffer's
+    // sample rate (the ECG/PPG rows may differ from the EEG rows);
+    // _bioFftEpoch invalidates results computed before the latest LayoutBio.
+    private readonly struct BioFftBinding
+    {
+        public readonly RingBuffer? Buffer;
+        public readonly int Channel;
+        public BioFftBinding(RingBuffer? buffer, int channel) { Buffer = buffer; Channel = channel; }
+    }
+    private bool _bioFftReady;
+    private int _bioFftResultEpoch = -1;
+    private string _bioFftMac = string.Empty;
+    private List<int> _bioFftResultRows = new();
+    private List<float[]> _bioFftResultFreqs = new();
+    private List<float[]> _bioFftResultMags = new();
+    private long _bioFftLastSubmitMs;
+    private int _bioFftEpoch;
+    private BioFftBinding[] _bioFftRows = new BioFftBinding[8];
 
     private int _tickCount;
 
+    // SDK backend label
+    private readonly string _sdkVersion;
+    private string _shownBackend = string.Empty;
+    private bool _backendQueryPending;
+    private long _backendQueryMs;
+
     private readonly List<Controls.WaveformControl> _bioWaves;
+    private readonly List<Controls.SpectrumControl> _bioSpectra;
+    private readonly List<Grid> _bioRows;
     private readonly Dictionary<string, CheckBox> _ntfBoxes = new();
     private readonly Dictionary<string, CheckBox> _filterBoxes = new();
     private readonly Dictionary<int, RadioButton> _sampleRateRadios = new();
+    private readonly Dictionary<int, RadioButton> _emgSampleRateRadios = new();
+    private readonly Dictionary<int, RadioButton> _imuSampleRateRadios = new();
+    private readonly Dictionary<int, RadioButton> _ppgSampleRateRadios = new();
     private readonly Dictionary<string, TextBlock> _valueLabels = new();
     private (List<float>? impedance, int channel)[] _bioTargets = new (List<float>?, int)[8];
     private int _bioPage;
@@ -112,6 +152,7 @@ public sealed partial class MainWindow : Window
         public string Name = string.Empty;
         public string Mac = string.Empty;
         public int Rssi;
+        public int MissedRounds;
     }
 
     // Device-list row
@@ -132,13 +173,17 @@ public sealed partial class MainWindow : Window
     {
         InitializeComponent();
 
-        string sdkVersion = _ctrl.GetVersion();
-        Title = $"SensorSDKCXX IMU + Quaternion + EMG + EEG Demo (Multi) (sensor-sdk v{sdkVersion}, demo v{DemoVersion})";
-        SdkLabel.Text = "SDK: " + sdkVersion;
+        _sdkVersion = _ctrl.GetVersion();
+        Title = $"SensorSDKCXX IMU + Quaternion + EMG + EEG Demo (Multi) (sensor-sdk v{_sdkVersion}, demo v{DemoVersion})";
+        SdkLabel.Text = "SDK: " + _sdkVersion;
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1600, 900));
 
         _bioWaves = [BioWave0, BioWave1, BioWave2, BioWave3,
                      BioWave4, BioWave5, BioWave6, BioWave7];
+        _bioSpectra = [BioSpec0, BioSpec1, BioSpec2, BioSpec3,
+                       BioSpec4, BioSpec5, BioSpec6, BioSpec7];
+        _bioRows = [BioRow0, BioRow1, BioRow2, BioRow3,
+                    BioRow4, BioRow5, BioRow6, BioRow7];
         foreach (Controls.WaveformControl w in _bioWaves)
             w.SetAutoYRange();
 
@@ -170,18 +215,14 @@ public sealed partial class MainWindow : Window
             _filterBoxes[key] = cb;
             FilterPanel.Children.Add(cb);
         }
-        foreach (int rate in SampleRateCandidates)
-        {
-            var rb = new RadioButton
-            {
-                Content = $"{rate} Hz",
-                GroupName = "EegSampleRate",
-                IsEnabled = false,
-            };
-            rb.Checked += (_, _) => OnSampleRateChecked(rate);
-            _sampleRateRadios[rate] = rb;
-            SampleRatePanel.Children.Add(rb);
-        }
+        BuildRateRadios(SampleRateCandidates, "EegSampleRate", SampleRatePanel,
+                        _sampleRateRadios, OnEegSampleRateChecked);
+        BuildRateRadios(EmgSampleRateCandidates, "EmgSampleRate", EmgSampleRatePanel,
+                        _emgSampleRateRadios, OnEmgSampleRateChecked);
+        BuildRateRadios(ImuSampleRateCandidates, "ImuSampleRate", ImuSampleRatePanel,
+                        _imuSampleRateRadios, OnImuSampleRateChecked);
+        BuildRateRadios(PpgSampleRateCandidates, "PpgSampleRate", PpgSampleRatePanel,
+                        _ppgSampleRateRadios, OnPpgSampleRateChecked);
         foreach (string label in LiveFilter.BandLabels())
             FilterCombo.Items.Add(label);
         FilterCombo.SelectedIndex = 0;
@@ -197,6 +238,8 @@ public sealed partial class MainWindow : Window
         if (_debugLogEnabled)
             ApplySdkDebugLog();
 
+        ApplyDongleDebug();
+
         _plotTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(PlotUpdateIntervalMs) };
         _plotTimer.Tick += (_, _) => OnPlotTick();
         _plotTimer.Start();
@@ -204,6 +247,23 @@ public sealed partial class MainWindow : Window
         Closed += OnWindowClosed;
 
         RetargetWaveforms();
+    }
+
+    private static void BuildRateRadios(int[] candidates, string groupName, StackPanel panel,
+                                        Dictionary<int, RadioButton> radios, Action<int> onChecked)
+    {
+        foreach (int rate in candidates)
+        {
+            var rb = new RadioButton
+            {
+                Content = $"{rate} Hz",
+                GroupName = groupName,
+                IsEnabled = false,
+            };
+            rb.Checked += (_, _) => onChecked(rate);
+            radios[rate] = rb;
+            panel.Children.Add(rb);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -294,6 +354,9 @@ public sealed partial class MainWindow : Window
 
     private void OnScanResults(List<BleDevice> devices)
     {
+        var present = new HashSet<string>();
+        foreach (BleDevice d in devices)
+            present.Add(d.Mac);
         foreach (BleDevice d in devices)
         {
             int found = _discovered.FindIndex(x => x.Mac == d.Mac);
@@ -306,11 +369,39 @@ public sealed partial class MainWindow : Window
             else
             {
                 _discovered[found].Rssi = d.Rssi;
+                _discovered[found].MissedRounds = 0;
                 lock (_statesMutex)
                     UpdateDeviceItemText(d.Mac, _deviceStates.ContainsKey(d.Mac));
             }
         }
+        EvictStaleDevices(present);
         UpdateButtonStates();
+    }
+
+    // Rows absent from two consecutive scan rounds are dropped; connected
+    // devices and replay rows are exempt.
+    private void EvictStaleDevices(HashSet<string> present)
+    {
+        for (int i = _discovered.Count - 1; i >= 0; i--)
+        {
+            DeviceEntry entry = _discovered[i];
+            if (present.Contains(entry.Mac))
+                continue;
+            bool exempt = _replayMacs.Contains(entry.Mac);
+            if (!exempt)
+            {
+                lock (_statesMutex)
+                    exempt = _deviceStates.ContainsKey(entry.Mac);
+            }
+            if (exempt)
+                continue;
+            if (++entry.MissedRounds < 4)
+                continue;
+            DeviceRow? row = DeviceList.Items.OfType<DeviceRow>().FirstOrDefault(r => r.Mac == entry.Mac);
+            if (row != null)
+                DeviceList.Items.Remove(row);
+            _discovered.RemoveAt(i);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -411,8 +502,15 @@ public sealed partial class MainWindow : Window
         foreach (DeviceEntry d in _discovered)
             if (d.Mac == mac) { name = d.Name; break; }
         AppLog($"User: connect {name} ({mac})");
+        if (_ctrl.IsScanning)
+        {
+            _ctrl.StopScan();
+            _scanning = false;
+            ScanButton.IsEnabled = _replayMacs.Count == 0;
+            StopScanButton.IsEnabled = false;
+        }
 
-        SensorProfile profile = _ctrl.RequireSensor(mac);
+        SensorProfile profile = _ctrl.RequireSensor(mac)!;
         HookProfileEvents(profile);
         profile.SetAutoReconnect(AutoReconnectBox.IsChecked == true);
 
@@ -580,6 +678,12 @@ public sealed partial class MainWindow : Window
             cb.IsEnabled = false;
         foreach (RadioButton rb in _sampleRateRadios.Values)
             rb.IsEnabled = false;
+        foreach (RadioButton rb in _emgSampleRateRadios.Values)
+            rb.IsEnabled = false;
+        foreach (RadioButton rb in _imuSampleRateRadios.Values)
+            rb.IsEnabled = false;
+        foreach (RadioButton rb in _ppgSampleRateRadios.Values)
+            rb.IsEnabled = false;
         if (st.Profile.DeviceState == SenDeviceState.Disconnected)
         {
             OnStateChanged(st.Mac, SenDeviceState.Disconnected);
@@ -654,6 +758,12 @@ public sealed partial class MainWindow : Window
         st.FilterStates.Clear();
         st.SampleRateOptions.Clear();
         st.SampleRateCurrent = 0;
+        st.EmgSampleRateOptions.Clear();
+        st.EmgSampleRateCurrent = 0;
+        st.ImuSampleRateOptions.Clear();
+        st.ImuSampleRateCurrent = 0;
+        st.PpgSampleRateOptions.Clear();
+        st.PpgSampleRateCurrent = 0;
         lock (_statesMutex)
             _deviceStates.Remove(mac);
         AppLog($"App: device disconnected, removed from UI: {mac}");
@@ -694,14 +804,35 @@ public sealed partial class MainWindow : Window
         DeviceState? st = StateFor(mac);
         if (st == null)
             return;
-        st.Info = st.Profile.GetDeviceInfo();
+        DeviceInfo? info = st.Profile.GetDeviceInfo();
+        if (info == null)
+            return;
+        st.Info = info;
         st.HasInfo = true;
         st.SyncSampleRates();
         if (st.Info.EEGSampleRate > 0 && st.Info.EEGSampleRate != st.SampleRateCurrent)
         {
             st.SampleRateCurrent = st.Info.EEGSampleRate;
             if (mac == _currentMac)
-                SetSampleRateChecked(st.SampleRateCurrent);
+                SetRateChecked(_sampleRateRadios, st.SampleRateCurrent);
+        }
+        if (st.Info.EMGSampleRate > 0 && st.Info.EMGSampleRate != st.EmgSampleRateCurrent)
+        {
+            st.EmgSampleRateCurrent = st.Info.EMGSampleRate;
+            if (mac == _currentMac)
+                SetRateChecked(_emgSampleRateRadios, st.EmgSampleRateCurrent);
+        }
+        if (st.Info.AccSampleRate > 0 && st.Info.AccSampleRate != st.ImuSampleRateCurrent)
+        {
+            st.ImuSampleRateCurrent = st.Info.AccSampleRate;
+            if (mac == _currentMac)
+                SetRateChecked(_imuSampleRateRadios, st.ImuSampleRateCurrent);
+        }
+        if (st.Info.PpgSampleRate > 0 && st.Info.PpgSampleRate != st.PpgSampleRateCurrent)
+        {
+            st.PpgSampleRateCurrent = st.Info.PpgSampleRate;
+            if (mac == _currentMac)
+                SetRateChecked(_ppgSampleRateRadios, st.PpgSampleRateCurrent);
         }
         if (mac == _currentMac)
         {
@@ -815,20 +946,34 @@ public sealed partial class MainWindow : Window
         ClearUiData();
     }
 
-    private async void OnSampleRateChecked(int rate)
+    private void OnEegSampleRateChecked(int rate) => OnRateChecked(_sampleRateRadios, "EEG_SAMPLE_RATE", rate);
+    private void OnEmgSampleRateChecked(int rate) => OnRateChecked(_emgSampleRateRadios, "EMG_SAMPLE_RATE", rate);
+    private void OnImuSampleRateChecked(int rate) => OnRateChecked(_imuSampleRateRadios, "IMU_SAMPLE_RATE", rate);
+    private void OnPpgSampleRateChecked(int rate) => OnRateChecked(_ppgSampleRateRadios, "PPG_SAMPLE_RATE", rate);
+
+    private void OnRateChecked(Dictionary<int, RadioButton> radios, string key, int rate)
     {
         if (_updatingControls)
             return;
         DeviceState? st = CurrentState();
         if (st == null || !st.Profile.IsReady)
             return;
+        SetRateChecked(radios, rate);
+        DispatcherQueue.TryEnqueue(() => _ = ApplySampleRate(key, rate));
+    }
+
+    private async Task ApplySampleRate(string key, int rate)
+    {
+        DeviceState? st = CurrentState();
+        if (st == null || !st.Profile.IsReady)
+            return;
         string value = rate.ToString();
-        (string msg, bool isError) = await SendSetParam(st.Profile, "EEG_SAMPLE_RATE", value);
-        AppLog($"User: setParam(EEG_SAMPLE_RATE, {value}) -> {msg}");
-        RecordSavedParam(st.Mac, "EEG_SAMPLE_RATE", value, msg);
+        (string msg, bool isError) = await SendSetParam(st.Profile, key, value);
+        AppLog($"User: setParam({key}, {value}) -> {msg}");
+        RecordSavedParam(st.Mac, key, value, msg);
         if (isError)
         {
-            ShowWarning("Set Parameter Failed", $"Failed to set EEG_SAMPLE_RATE:\n{msg}");
+            ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
             RefreshControlStates(st);
             return;
         }
@@ -857,28 +1002,62 @@ public sealed partial class MainWindow : Window
         string filterResult = await SafeGetParam(st.Profile, "FILTER");
         string rateListResult = await SafeGetParam(st.Profile, "EEG_SAMPLE_RATE_LIST");
         string rateResult = await SafeGetParam(st.Profile, "EEG_SAMPLE_RATE");
+        string emgListResult = await SafeGetParam(st.Profile, "EMG_SAMPLE_RATE_LIST");
+        string emgRateResult = await SafeGetParam(st.Profile, "EMG_SAMPLE_RATE");
+        string imuListResult = await SafeGetParam(st.Profile, "IMU_SAMPLE_RATE_LIST");
+        string imuRateResult = await SafeGetParam(st.Profile, "IMU_SAMPLE_RATE");
+        string ppgListResult = await SafeGetParam(st.Profile, "PPG_SAMPLE_RATE_LIST");
+        string ppgRateResult = await SafeGetParam(st.Profile, "PPG_SAMPLE_RATE");
         st = StateFor(mac);
         if (st == null)
             return;
-        ApplyRefreshedControlStates(st, ntfResult, filterResult, rateListResult, rateResult);
+        ApplyRefreshedControlStates(st, ntfResult, filterResult,
+                                    ParseRateState(rateListResult, rateResult),
+                                    ParseRateState(emgListResult, emgRateResult),
+                                    ParseRateState(imuListResult, imuRateResult),
+                                    ParseRateState(ppgListResult, ppgRateResult));
+    }
+
+    private static (List<int> options, int current) ParseRateState(string listResult, string rateResult)
+    {
+        var options = new List<int>();
+        if (!listResult.StartsWith("Error"))
+        {
+            foreach (string item in listResult.Split('|', StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (int.TryParse(item, out int rate))
+                    options.Add(rate);
+            }
+        }
+        int current = 0;
+        if (!rateResult.StartsWith("Error") && int.TryParse(rateResult, out int rc))
+            current = rc;
+        return (options, current);
     }
 
     private void ApplyRefreshedControlStates(DeviceState st, string ntfResult, string filterResult,
-                                             string rateListResult, string rateResult)
+                                             (List<int> options, int current) eeg,
+                                             (List<int> options, int current) emg,
+                                             (List<int> options, int current) imu,
+                                             (List<int> options, int current) ppg)
     {
         int emgCh = st.HasInfo ? st.Info.EMGChannelCount : 0;
         int eegCh = st.HasInfo ? st.Info.EEGChannelCount : 0;
+        int impeCh = st.HasInfo ? st.Info.ImpeChannelCount : 0;
         int imuCh = st.HasInfo ? Math.Max(st.Info.AccChannelCount, st.Info.GyroChannelCount) : 0;
         int ppgCh = st.HasInfo ? st.Info.PpgChannelCount : 0;
         int spo2Ch = st.HasInfo ? st.Info.Spo2ChannelCount : 0;
+        int magCh = st.HasInfo ? st.Info.MagAngleChannelCount : 0;
         var channelMap = new Dictionary<string, int>
         {
             ["NTF_EEG"] = eegCh,
+            ["NTF_IMPEDANCE"] = impeCh,
             ["NTF_EMG"] = emgCh,
             ["NTF_GEST"] = emgCh,
             ["NTF_PPG"] = ppgCh,
             ["NTF_SPO2"] = spo2Ch,
             ["NTF_IMU"] = imuCh,
+            ["NTF_MAG_ANGLE"] = magCh,
         };
 
         var ntf = new Dictionary<string, (bool enabled, bool check)>();
@@ -905,32 +1084,26 @@ public sealed partial class MainWindow : Window
         foreach (string key in _filterBoxes.Keys)
             filters[key] = (hasFilter, hasFilter && parsed.GetValueOrDefault(key) == "ON");
 
-        // EEG Sample Rate radios
-        var rateOptions = new List<int>();
-        if (!rateListResult.StartsWith("Error"))
-        {
-            foreach (string item in rateListResult.Split('|', StringSplitOptions.RemoveEmptyEntries))
-            {
-                if (int.TryParse(item, out int rate))
-                    rateOptions.Add(rate);
-            }
-        }
-        int rateCurrent = 0;
-        if (!rateResult.StartsWith("Error") && int.TryParse(rateResult, out int rc))
-            rateCurrent = rc;
-
         st.NtfStates = ntf;
         st.FilterStates = filters;
-        st.SampleRateOptions = rateOptions;
-        st.SampleRateCurrent = rateCurrent;
+        st.SampleRateOptions = eeg.options;
+        st.SampleRateCurrent = eeg.current;
+        st.EmgSampleRateOptions = emg.options;
+        st.EmgSampleRateCurrent = emg.current;
+        st.ImuSampleRateOptions = imu.options;
+        st.ImuSampleRateCurrent = imu.current;
+        st.PpgSampleRateOptions = ppg.options;
+        st.PpgSampleRateCurrent = ppg.current;
         if (st == CurrentState())
-            ApplyControlStates(ntf, filters, rateOptions, rateCurrent,
-                               st.HasInfo && st.Info.EEGChannelCount == 0);
+            ApplyControlStates(ntf, filters, eeg, emg, imu, ppg);
     }
 
     private void ApplyControlStates(Dictionary<string, (bool enabled, bool check)> ntf,
                                     Dictionary<string, (bool enabled, bool check)> filters,
-                                    List<int> rateOptions, int rateCurrent, bool hideSampleRate)
+                                    (List<int> options, int current) eeg,
+                                    (List<int> options, int current) emg,
+                                    (List<int> options, int current) imu,
+                                    (List<int> options, int current) ppg)
     {
         _updatingControls = true;
         try
@@ -951,15 +1124,10 @@ public sealed partial class MainWindow : Window
                 kv.Value.IsEnabled = state.enabled;
                 kv.Value.IsChecked = state.check;
             }
-            SampleRateSection.Visibility = hideSampleRate ? Visibility.Collapsed : Visibility.Visible;
-            foreach (var kv in _sampleRateRadios)
-            {
-                bool supported = rateOptions.Contains(kv.Key);
-                kv.Value.Visibility = supported || rateOptions.Count == 0
-                    ? Visibility.Visible : Visibility.Collapsed;
-                kv.Value.IsEnabled = supported;
-                kv.Value.IsChecked = kv.Key == rateCurrent;
-            }
+            ApplyRateGroup(SampleRateSection, _sampleRateRadios, eeg.options, eeg.current);
+            ApplyRateGroup(EmgSampleRateSection, _emgSampleRateRadios, emg.options, emg.current);
+            ApplyRateGroup(ImuSampleRateSection, _imuSampleRateRadios, imu.options, imu.current);
+            ApplyRateGroup(PpgSampleRateSection, _ppgSampleRateRadios, ppg.options, ppg.current);
         }
         finally
         {
@@ -967,13 +1135,26 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private static void ApplyRateGroup(UIElement section, Dictionary<int, RadioButton> radios,
+                                       List<int> options, int current)
+    {
+        section.Visibility = options.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        foreach (var kv in radios)
+        {
+            bool supported = options.Contains(kv.Key);
+            kv.Value.Visibility = supported ? Visibility.Visible : Visibility.Collapsed;
+            kv.Value.IsEnabled = supported;
+            kv.Value.IsChecked = kv.Key == current;
+        }
+    }
+
     /// <summary>Syncs the sample-rate radios' checked state.</summary>
-    private void SetSampleRateChecked(int rate)
+    private void SetRateChecked(Dictionary<int, RadioButton> radios, int rate)
     {
         _updatingControls = true;
         try
         {
-            foreach (var kv in _sampleRateRadios)
+            foreach (var kv in radios)
                 kv.Value.IsChecked = kv.Key == rate;
         }
         finally
@@ -997,9 +1178,9 @@ public sealed partial class MainWindow : Window
             "Documents",
             "sensorsdklog",
             DateTime.Now.ToString("yyyyMMdd_HHmmss") + "_" + version);
-        _ctrl.SetLogPath(true, dir);
-        _ctrl.SetDebugEnabled(true);
-        System.Diagnostics.Debug.WriteLine("[DemoWinUI3] setLogPath -> " + dir);
+        _ = _ctrl.SetParamAsync("LOG_PATH", dir);
+        _ = _ctrl.SetParamAsync("DEBUG_ENABLED", "True");
+        System.Diagnostics.Debug.WriteLine("[DemoWinUI3] LOG_PATH -> " + dir);
     }
 
     private void OnDebugLogToggled(object sender, RoutedEventArgs e)
@@ -1009,7 +1190,7 @@ public sealed partial class MainWindow : Window
         if (_debugLogEnabled)
             ApplySdkDebugLog();
         else
-            _ctrl.SetDebugEnabled(false);
+            _ = _ctrl.SetParamAsync("DEBUG_ENABLED", "False");
         string value = _debugLogEnabled ? "True" : "False";
         foreach (DeviceState st in SnapshotStates())
         {
@@ -1030,6 +1211,19 @@ public sealed partial class MainWindow : Window
                 continue;
             _ = PushDebugPathParam(st, "DEBUG_BLE_DATA_PATH", value);
         }
+    }
+
+    private void ApplyDongleDebug()
+    {
+        string value = _dongleDebugEnabled ? "True" : "False";
+        _ = _ctrl.SetParamAsync("BLE_TRACE_ENABLED", value);
+    }
+
+    private void OnDongleDebugToggled(object sender, RoutedEventArgs e)
+    {
+        _dongleDebugEnabled = DongleDebugBox.IsChecked == true;
+        AppLog($"User: dongle debug {(_dongleDebugEnabled ? "ON" : "OFF")}");
+        ApplyDongleDebug();
     }
 
     private List<DeviceState> SnapshotStates()
@@ -1117,9 +1311,10 @@ public sealed partial class MainWindow : Window
 
     private static string LinkTextOf(DeviceInfo info)
     {
+        string backendPart = info.Backend.Length == 0 ? string.Empty : $" | backend {info.Backend}";
         if (info.PeripheralLatency < 0 || info.ConnectionIntervalMs <= 0)
-            return "Link: --";
-        return $"Link: {info.ConnectionIntervalMs}ms / latency {info.PeripheralLatency} / timeout {info.SupervisionTimeoutMs}ms";
+            return "Link: --" + backendPart;
+        return $"Link: {info.ConnectionIntervalMs}ms / latency {info.PeripheralLatency} / timeout {info.SupervisionTimeoutMs}ms" + backendPart;
     }
 
     private static string MtuTextOf(DeviceInfo info)
@@ -1219,7 +1414,8 @@ public sealed partial class MainWindow : Window
         if (st == null || st.GetBioKind() != DeviceState.BioKind.EEG)
             return 1;
         int extras = (st.Info.ECGChannelCount > 0 ? 1 : 0)
-                   + (st.Info.BRTHChannelCount > 0 ? 1 : 0);
+                   + (st.Info.BRTHChannelCount > 0 ? 1 : 0)
+                   + (st.Info.MagAngleChannelCount > 0 ? 1 : 0);
         int perPage = _bioWaves.Count - extras;
         int total = st.Info.EEGChannelCount > 0 ? st.Info.EEGChannelCount
                   : st.Eeg.Allocated ? st.Eeg.Channels : 0;
@@ -1255,41 +1451,86 @@ public sealed partial class MainWindow : Window
         LayoutBio(st);
     }
 
+    // Row spectrum binding: buf != null shows the row's spectrum (computed
+    // with that buffer's own sample rate), null hides it (the waveform then
+    // spans the full row width).
+    private void SetBioSpectrum(int row, RingBuffer? buf, int channel, int colorIndex, string label)
+    {
+        if (buf != null && channel >= 0)
+        {
+            _bioFftRows[row] = new BioFftBinding(buf, channel);
+            _bioSpectra[row].SetColorIndex(colorIndex);
+            _bioSpectra[row].SetLabels([label]);
+            _bioSpectra[row].SetPlaceholder(string.Empty);
+            _bioSpectra[row].Visibility = Visibility.Visible;
+            _bioRows[row].ColumnDefinitions[0].Width = new GridLength(1, GridUnitType.Star);
+        }
+        else
+        {
+            _bioSpectra[row].ClearResult();
+            _bioSpectra[row].Visibility = Visibility.Collapsed;
+            _bioRows[row].ColumnDefinitions[0].Width = new GridLength(0);
+        }
+    }
+
     private void LayoutBio(DeviceState? st)
     {
         _bioTargets = new (List<float>?, int)[_bioWaves.Count];
+        // Row spectrum binding: Buffer != null shows the row's spectrum,
+        // null hides it (the waveform then spans the full row width).
+        ++_bioFftEpoch;
+        _bioFftRows = new BioFftBinding[_bioWaves.Count];
         DeviceState.BioKind kind = st?.GetBioKind() ?? DeviceState.BioKind.None;
         string waiting = st != null ? "Waiting for data ..." : "Not connected";
 
         if (kind == DeviceState.BioKind.EMG && st != null)
         {
-            BioTitleText.Text = "EMG Waveform";
-            int emgCh = st.Emg.Allocated ? Math.Min(st.Emg.Channels, _bioWaves.Count) : 0;
+            bool hasMag = st.Info.MagAngleChannelCount > 0 || st.MagAngle.Allocated;
+            int emgCh = st.Emg.Allocated ? Math.Min(st.Emg.Channels, _bioWaves.Count - (hasMag ? 1 : 0)) : 0;
+            int magIndex = emgCh;
+            BioTitleText.Text = hasMag && emgCh > 0 ? "EMG + Angle Waveform"
+                              : hasMag ? "Angle Waveform"
+                                       : "EMG Waveform";
             for (int i = 0; i < _bioWaves.Count; i++)
             {
                 if (i < emgCh)
                 {
                     _bioWaves[i].SetSource(st.Emg, st.BufMutex, i);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels([$"EMG-{i + 1}"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, st.Emg, i, i, $"EMG-{i + 1}");
                     _bioTargets[i] = (st.EmgImpedance, i);
+                }
+                else if (hasMag && i == magIndex && st.MagAngle.Allocated)
+                {
+                    _bioWaves[i].SetSource(st.MagAngle, st.BufMutex, 0, i);
+                    _bioWaves[i].SetFixedYRange(0.0, 180.0);
+                    _bioWaves[i].SetLabels(["Angle"]);
+                    _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, st.MagAngle, 0, i, "Angle");
+                    _bioTargets[i] = (null, 0);
                 }
                 else
                 {
                     _bioWaves[i].SetSource(null, null, i);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels([]);
                     _bioWaves[i].SetPlaceholder(waiting);
                     _bioWaves[i].SetSideText(string.Empty, Microsoft.UI.Colors.White);
+                    SetBioSpectrum(i, null, -1, -1, string.Empty);
                     _bioTargets[i] = (null, 0);
                 }
             }
         }
         else if (kind == DeviceState.BioKind.EEG && st != null)
         {
-            BioTitleText.Text = "EEG + ECG + BRTH Waveform";
             bool hasECG = st.Info.ECGChannelCount > 0 || st.Ecg.Allocated;
             bool hasBRTH = st.Info.BRTHChannelCount > 0 || st.Brth.Allocated;
-            int perPage = _bioWaves.Count - (hasECG ? 1 : 0) - (hasBRTH ? 1 : 0);
+            bool hasMag = st.Info.MagAngleChannelCount > 0 || st.MagAngle.Allocated;
+            BioTitleText.Text = hasMag ? "EEG + ECG + BRTH + Angle Waveform"
+                                       : "EEG + ECG + BRTH Waveform";
+            int perPage = _bioWaves.Count - (hasECG ? 1 : 0) - (hasBRTH ? 1 : 0) - (hasMag ? 1 : 0);
             int total = st.Info.EEGChannelCount > 0 ? st.Info.EEGChannelCount
                       : st.Eeg.Allocated ? st.Eeg.Channels : 0;
             int pages = Math.Max(1, (total + perPage - 1) / perPage);
@@ -1297,37 +1538,55 @@ public sealed partial class MainWindow : Window
             int startCh = _bioPage * perPage;
             int ecgIndex = _bioWaves.Count - 1 - (hasBRTH ? 1 : 0);
             int brthIndex = _bioWaves.Count - 1;
+            int magIndex = ecgIndex - (hasECG ? 1 : 0);
             for (int i = 0; i < _bioWaves.Count; i++)
             {
                 int eegCh = startCh + i;
                 if (i < perPage && eegCh < total && st.Eeg.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Eeg, st.BufMutex, eegCh);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels([$"EEG-{eegCh + 1}"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, st.Eeg, eegCh, eegCh, $"EEG-{eegCh + 1}");
                     _bioTargets[i] = (st.EegImpedance, eegCh);
                 }
                 else if (hasECG && i == ecgIndex && st.Ecg.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Ecg, st.BufMutex, 0);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels(["ECG"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, st.Ecg, 0, 0, "ECG");
                     _bioTargets[i] = (st.EcgImpedance, 0);
                 }
                 else if (hasBRTH && i == brthIndex && st.Brth.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Brth, st.BufMutex, 0);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels(["BRTH"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, null, -1, -1, string.Empty);
                     _bioTargets[i] = (st.BrthImpedance, 0);
+                }
+                else if (hasMag && i == magIndex && st.MagAngle.Allocated)
+                {
+                    _bioWaves[i].SetSource(st.MagAngle, st.BufMutex, 0, i);
+                    _bioWaves[i].SetFixedYRange(0.0, 180.0);
+                    _bioWaves[i].SetLabels(["Angle"]);
+                    _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, st.MagAngle, 0, i, "Angle");
+                    _bioTargets[i] = (null, 0);
                 }
                 else
                 {
                     _bioWaves[i].SetSource(null, null, i);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels([]);
                     bool noSuchChannel = i < perPage && eegCh >= total;
                     _bioWaves[i].SetPlaceholder(noSuchChannel ? string.Empty : waiting);
                     _bioWaves[i].SetSideText(string.Empty, Microsoft.UI.Colors.White);
+                    SetBioSpectrum(i, null, -1, -1, string.Empty);
                     _bioTargets[i] = (null, 0);
                 }
             }
@@ -1335,26 +1594,31 @@ public sealed partial class MainWindow : Window
         else if (kind == DeviceState.BioKind.PPG && st != null)
         {
             BioTitleText.Text = "EEG + PPG + SpO2 Waveform";
-            (RingBuffer buffer, int channel, string label, bool isEeg)[] plotConfig =
+            (RingBuffer buffer, int channel, string label, bool isEeg, bool hasFft)[] plotConfig =
             [
-                (st.Eeg, 0, "fp1", true),
-                (st.Eeg, 1, "fp2", true),
-                (st.Ppg, 0, "red_led", false),
-                (st.Ppg, 1, "ir_led", false),
-                (st.Spo2, 0, "spo2", false),
-                (st.Spo2, 1, "heart_rate", false),
+                (st.Eeg, 0, "fp1", true, true),
+                (st.Eeg, 1, "fp2", true, true),
+                (st.Ppg, 0, "red_led", false, true),
+                (st.Ppg, 1, "ir_led", false, true),
+                (st.Spo2, 0, "spo2", false, false),
+                (st.Spo2, 1, "heart_rate", false, false),
             ];
             for (int i = 0; i < _bioWaves.Count; i++)
             {
                 bool bound = false;
                 if (i < plotConfig.Length)
                 {
-                    (RingBuffer buf, int channel, string label, bool isEeg) = plotConfig[i];
+                    (RingBuffer buf, int channel, string label, bool isEeg, bool hasFft) = plotConfig[i];
                     if (buf.Allocated && channel < buf.Channels)
                     {
                         _bioWaves[i].SetSource(buf, st.BufMutex, channel, i);
+                        _bioWaves[i].SetAutoYRange();
                         _bioWaves[i].SetLabels([label]);
                         _bioWaves[i].SetPlaceholder(string.Empty);
+                        if (hasFft)
+                            SetBioSpectrum(i, buf, channel, i, label);
+                        else
+                            SetBioSpectrum(i, null, -1, -1, string.Empty);
                         _bioTargets[i] = isEeg ? (st.EegImpedance, channel) : (null, 0);
                         bound = true;
                     }
@@ -1362,9 +1626,11 @@ public sealed partial class MainWindow : Window
                 if (!bound)
                 {
                     _bioWaves[i].SetSource(null, null, i);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels([]);
                     _bioWaves[i].SetPlaceholder(i < plotConfig.Length ? waiting : string.Empty);
                     _bioWaves[i].SetSideText(string.Empty, Microsoft.UI.Colors.White);
+                    SetBioSpectrum(i, null, -1, -1, string.Empty);
                     _bioTargets[i] = (null, 0);
                 }
             }
@@ -1375,9 +1641,11 @@ public sealed partial class MainWindow : Window
             for (int i = 0; i < _bioWaves.Count; i++)
             {
                 _bioWaves[i].SetSource(null, null, i);
+                _bioWaves[i].SetAutoYRange();
                 _bioWaves[i].SetLabels([]);
                 _bioWaves[i].SetPlaceholder(waiting);
                 _bioWaves[i].SetSideText(string.Empty, Microsoft.UI.Colors.White);
+                SetBioSpectrum(i, null, -1, -1, string.Empty);
                 _bioTargets[i] = (null, 0);
             }
         }
@@ -1419,13 +1687,19 @@ public sealed partial class MainWindow : Window
         DeviceState? st = CurrentState();
         if (st == null || _bioTargets.Length != _bioWaves.Count)
             return;
+        (bool enabled, bool check) impState = st.NtfStates.GetValueOrDefault("NTF_IMPEDANCE");
+        bool impedanceOn = impState.enabled && impState.check;
         lock (st.BufMutex)
         {
             for (int i = 0; i < _bioWaves.Count; i++)
             {
                 (List<float>? impedance, int channel) = _bioTargets[i];
-                if (impedance == null || channel >= impedance.Count || impedance[channel] < 0)
+                if (!impedanceOn || impedance == null || channel >= impedance.Count
+                    || impedance[channel] < 0)
+                {
+                    _bioWaves[i].SetSideText(string.Empty, Microsoft.UI.Colors.White);
                     continue;
+                }
                 double kOhm = impedance[channel] / 1000.0;
                 Color color = kOhm <= 500 ? ColorHelper.FromArgb(255, 60, 200, 60)
                             : kOhm <= 999 ? ColorHelper.FromArgb(255, 230, 160, 40)
@@ -1483,9 +1757,10 @@ public sealed partial class MainWindow : Window
             Cube.ClearQuaternion();
         ApplyControlStates(st?.NtfStates ?? new Dictionary<string, (bool, bool)>(),
                            st?.FilterStates ?? new Dictionary<string, (bool, bool)>(),
-                           st?.SampleRateOptions ?? new List<int>(),
-                           st?.SampleRateCurrent ?? 0,
-                           st != null && st.HasInfo && st.Info.EEGChannelCount == 0);
+                           (st?.SampleRateOptions ?? new List<int>(), st?.SampleRateCurrent ?? 0),
+                           (st?.EmgSampleRateOptions ?? new List<int>(), st?.EmgSampleRateCurrent ?? 0),
+                           (st?.ImuSampleRateOptions ?? new List<int>(), st?.ImuSampleRateCurrent ?? 0),
+                           (st?.PpgSampleRateOptions ?? new List<int>(), st?.PpgSampleRateCurrent ?? 0));
     }
 
     private void UpdateLostPacketLabel()
@@ -1541,7 +1816,7 @@ public sealed partial class MainWindow : Window
         _fftBusy = true;
         int typeIndex = Math.Max(0, TypeCombo.SelectedIndex);
         string mac = st.Mac;
-        Task.Run(() =>
+        _fftTask = Task.Run(() =>
         {
             SpectrumCompute.Compute(snapshot, rate, out float[] freqs, out List<float[]> mags);
             lock (_fftMutex)
@@ -1570,6 +1845,131 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    // Per-row spectra of the bio rows: the bound rows' ring channels are
+    // snapshotted oldest -> newest and computed on the shared FFT worker,
+    // each row with its own buffer's sample rate; results whose device or
+    // bio layout no longer match are dropped.
+    private void MaybeSubmitBioFft(DeviceState? st)
+    {
+        if (st == null || _fftBusy)
+            return;
+        if (st.GetBioKind() == DeviceState.BioKind.None)
+            return;
+        bool anyBinding = false;
+        foreach (BioFftBinding b in _bioFftRows)
+        {
+            if (b.Buffer != null)
+            {
+                anyBinding = true;
+                break;
+            }
+        }
+        if (!anyBinding)
+            return;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (now - _bioFftLastSubmitMs < FftUpdateIntervalMs)
+            return;
+        var rows = new List<int>();
+        var snapshots = new List<float[]>();
+        var rates = new List<float>();
+        lock (st.BufMutex)
+        {
+            for (int row = 0; row < _bioFftRows.Length; row++)
+            {
+                BioFftBinding b = _bioFftRows[row];
+                RingBuffer? buf = b.Buffer;
+                // A row whose buffer is not ready yet is skipped without
+                // affecting the other rows.
+                if (buf == null || !buf.Allocated || buf.Length < 16
+                    || buf.SampleRate <= 0 || b.Channel >= buf.Channels)
+                    continue;
+                // Reassemble the circular buffer oldest -> newest.
+                var snapshot = new float[buf.Length];
+                float[] src = buf.Samples[b.Channel];
+                for (int i = 0; i < buf.Length; i++)
+                    snapshot[i] = src[(buf.WriteIndex + i) % buf.Length];
+                rows.Add(row);
+                snapshots.Add(snapshot);
+                rates.Add(buf.SampleRate);
+            }
+        }
+        if (rows.Count == 0)
+            return;
+        _bioFftLastSubmitMs = now;
+        _fftBusy = true;
+        int epoch = _bioFftEpoch;
+        string mac = st.Mac;
+        _fftTask = Task.Run(() =>
+        {
+            var allFreqs = new List<float[]>(rows.Count);
+            var allMags = new List<float[]>(rows.Count);
+            for (int k = 0; k < rows.Count; k++)
+            {
+                SpectrumCompute.Compute([snapshots[k]], rates[k], out float[] freqs, out List<float[]> mags);
+                allFreqs.Add(freqs);
+                allMags.Add(mags.Count > 0 ? mags[0] : Array.Empty<float>());
+            }
+            lock (_fftMutex)
+            {
+                _bioFftResultRows = rows;
+                _bioFftResultFreqs = allFreqs;
+                _bioFftResultMags = allMags;
+                _bioFftResultEpoch = epoch;
+                _bioFftMac = mac;
+                _bioFftReady = true;
+            }
+            _fftBusy = false;
+        });
+    }
+
+    private void PollBioFftResult()
+    {
+        lock (_fftMutex)
+        {
+            if (!_bioFftReady)
+                return;
+            _bioFftReady = false;
+            // Drop stale results: the device or the bio layout may have
+            // changed while the worker was computing.
+            DeviceState? st = CurrentState();
+            if (st == null || _bioFftMac != st.Mac || _bioFftResultEpoch != _bioFftEpoch)
+                return;
+            for (int k = 0; k < _bioFftResultRows.Count; k++)
+            {
+                int row = _bioFftResultRows[k];
+                if (row >= _bioSpectra.Count || row >= _bioFftRows.Length
+                    || _bioFftRows[row].Buffer == null || _bioFftResultMags[k].Length == 0)
+                    continue;
+                _bioSpectra[row].SetResult(_bioFftResultFreqs[k], [_bioFftResultMags[k]]);
+            }
+        }
+    }
+
+    // SDK backend label
+    private async void RefreshSdkLabel()
+    {
+        long now = Environment.TickCount64;
+        if (_backendQueryPending || now - _backendQueryMs < 1000)
+            return;
+        _backendQueryPending = true;
+        _backendQueryMs = now;
+        string backend;
+        try
+        {
+            backend = await _ctrl.GetParamAsync("BACK_END");
+        }
+        catch (Exception)
+        {
+            _backendQueryPending = false;
+            return;
+        }
+        _backendQueryPending = false;
+        if (_shuttingDown || backend == _shownBackend || backend.StartsWith("Error"))
+            return;
+        _shownBackend = backend;
+        SdkLabel.Text = $"SDK: {_sdkVersion} | Backend: {_shownBackend}";
+    }
+
     private void OnPlotTick()
     {
         if (_shuttingDown)
@@ -1577,12 +1977,20 @@ public sealed partial class MainWindow : Window
         Wave2d.Invalidate();
         foreach (Controls.WaveformControl w in _bioWaves)
             w.Invalidate();
+        foreach (Controls.SpectrumControl s in _bioSpectra)
+        {
+            if (s.Visibility == Visibility.Visible)
+                s.Invalidate();
+        }
 
         DeviceState? st = CurrentState();
         PollFftResult();
         MaybeSubmitFft(st);
+        PollBioFftResult();
+        MaybeSubmitBioFft(st);
 
-        bool bioReady = st != null && ((st.GetBioKind() == DeviceState.BioKind.EMG && st.Emg.Allocated)
+        bool bioReady = st != null && ((st.GetBioKind() == DeviceState.BioKind.EMG
+                                        && (st.Emg.Allocated || st.MagAngle.Allocated))
                                        || (st.GetBioKind() == DeviceState.BioKind.EEG && st.Eeg.Allocated)
                                        || (st.GetBioKind() == DeviceState.BioKind.PPG && st.Ppg.Allocated));
         if (bioReady && _bioWaves.Count > 0 && !_bioWaves[0].HasSource)
@@ -1609,6 +2017,7 @@ public sealed partial class MainWindow : Window
         ++_tickCount;
         if (_tickCount % (1000 / PlotUpdateIntervalMs) == 0)
         {
+            RefreshSdkLabel();
             if (st != null)
             {
                 st.UpdateActualRates();
@@ -1668,16 +2077,7 @@ public sealed partial class MainWindow : Window
                     return;
                 }
             }
-            // Multi start params by model set
-            var modelNames = new HashSet<string?>();
-            foreach (SensorProfile s in sensors)
-            {
-                DeviceState? st = StateFor(s.Device.Mac);
-                modelNames.Add(st != null && st.HasInfo ? st.Info.ModelName : null);
-            }
-            Dictionary<string, bool> results = modelNames.Count == 1 && !modelNames.Contains(null)
-                ? await _ctrl.MultiStartDataNotificationAsync(sensors)
-                : await _ctrl.MultiStartDataNotificationAsync(sensors, 60000, -1, 5);
+            Dictionary<string, bool> results = await _ctrl.MultiStartDataNotificationAsync(sensors);
             string[] failed = results.Where(kv => !kv.Value).Select(kv => kv.Key).ToArray();
             if (failed.Length > 0)
             {
@@ -1744,6 +2144,7 @@ public sealed partial class MainWindow : Window
         DeviceList.IsEnabled = !replaying;
         DebugLogBox.IsEnabled = !replaying;
         BinDataBox.IsEnabled = !replaying;
+        DongleDebugBox.IsEnabled = !replaying;
         ReplayButton.IsEnabled = !replaying;
         MultiReplayButton.IsEnabled = !replaying;
         ReplayPauseButton.IsEnabled = replaying;
@@ -1802,6 +2203,17 @@ public sealed partial class MainWindow : Window
         if (path == null)
             return;
         StartReplay(path);
+    }
+
+    private async void OnCheckDongleClicked(object sender, RoutedEventArgs e)
+    {
+        CheckDongleButton.IsEnabled = false;
+        try
+        {
+            string result = await _ctrl.CheckSetupDongleAsync();
+            ShowWarning("Check Dongle", result);
+        }
+        finally { CheckDongleButton.IsEnabled = true; }
     }
 
     private async void OnMultiReplayClicked(object sender, RoutedEventArgs e)
@@ -1871,7 +2283,22 @@ public sealed partial class MainWindow : Window
         if (info.DeviceInfo.EEGSampleRate > 0)
         {
             st.SampleRateCurrent = info.DeviceInfo.EEGSampleRate;
-            SetSampleRateChecked(st.SampleRateCurrent);
+            SetRateChecked(_sampleRateRadios, st.SampleRateCurrent);
+        }
+        if (info.DeviceInfo.EMGSampleRate > 0)
+        {
+            st.EmgSampleRateCurrent = info.DeviceInfo.EMGSampleRate;
+            SetRateChecked(_emgSampleRateRadios, st.EmgSampleRateCurrent);
+        }
+        if (info.DeviceInfo.AccSampleRate > 0)
+        {
+            st.ImuSampleRateCurrent = info.DeviceInfo.AccSampleRate;
+            SetRateChecked(_imuSampleRateRadios, st.ImuSampleRateCurrent);
+        }
+        if (info.DeviceInfo.PpgSampleRate > 0)
+        {
+            st.PpgSampleRateCurrent = info.DeviceInfo.PpgSampleRate;
+            SetRateChecked(_ppgSampleRateRadios, st.PpgSampleRateCurrent);
         }
 
         RetargetWaveforms();
@@ -1903,7 +2330,8 @@ public sealed partial class MainWindow : Window
             StatusText.Text = "Replay aborted: duplicate device address among bin files";
             return;
         }
-        SensorProfile?[] profiles = _ctrl.MultiReplayBinFile(paths.ToArray(), macs, true, ReplayDelegateTimeoutMs);
+        SensorProfile[] sensors = macs.Select(m => _ctrl.RequireSensor(m)!).ToArray();
+        SensorProfile?[] profiles = _ctrl.MultiReplayBinFile(paths.ToArray(), sensors, true, ReplayDelegateTimeoutMs);
         int started = 0;
         for (int i = 0; i < profiles.Length; i++)
         {
@@ -1935,7 +2363,25 @@ public sealed partial class MainWindow : Window
             {
                 st.SampleRateCurrent = infos[i].DeviceInfo.EEGSampleRate;
                 if (mac == _currentMac)
-                    SetSampleRateChecked(st.SampleRateCurrent);
+                    SetRateChecked(_sampleRateRadios, st.SampleRateCurrent);
+            }
+            if (infos[i].DeviceInfo.EMGSampleRate > 0)
+            {
+                st.EmgSampleRateCurrent = infos[i].DeviceInfo.EMGSampleRate;
+                if (mac == _currentMac)
+                    SetRateChecked(_emgSampleRateRadios, st.EmgSampleRateCurrent);
+            }
+            if (infos[i].DeviceInfo.AccSampleRate > 0)
+            {
+                st.ImuSampleRateCurrent = infos[i].DeviceInfo.AccSampleRate;
+                if (mac == _currentMac)
+                    SetRateChecked(_imuSampleRateRadios, st.ImuSampleRateCurrent);
+            }
+            if (infos[i].DeviceInfo.PpgSampleRate > 0)
+            {
+                st.PpgSampleRateCurrent = infos[i].DeviceInfo.PpgSampleRate;
+                if (mac == _currentMac)
+                    SetRateChecked(_ppgSampleRateRadios, st.PpgSampleRateCurrent);
             }
             _replayMacs.Add(mac);
             started++;
@@ -2052,7 +2498,9 @@ public sealed partial class MainWindow : Window
         string csv = path.EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
             ? path[..^4] + ".csv"
             : path + ".csv";
-        string result = await Task.Run(() => _ctrl.ParseBinToCsv(path, csv));
+        Task<string> analyzeTask = _ctrl.ParseBinToCsvAsync(path, csv);
+        _analyzeTask = analyzeTask;
+        string result = await analyzeTask;
         _analyzeRunning = false;
         AnalyzeButton.IsEnabled = true;
         if (result.StartsWith("Error"))
@@ -2080,6 +2528,19 @@ public sealed partial class MainWindow : Window
         _shuttingDown = true;
         AppLog("App: demo window closing");
         _plotTimer.Stop();
+        var pendingTasks = new List<Task>();
+        if (_fftTask != null)
+            pendingTasks.Add(_fftTask);
+        if (_analyzeTask != null)
+            pendingTasks.Add(_analyzeTask);
+        if (pendingTasks.Count > 0)
+        {
+            try
+            {
+                Task.WaitAll(pendingTasks.ToArray(), 2000);
+            }
+            catch { }
+        }
         _dataWorkerStop = true;
         _dataQueueEvent.Set();
         _dataWorker.Join();

@@ -56,6 +56,8 @@
                                 IsEnabled="False" MinWidth="110"/>
                         <Button x:Name="MultiReplayButton" Content="Multi Replay Bin" Click="OnMultiReplayClicked"
                                 MinWidth="110"/>
+                        <Button x:Name="CheckDongleButton" Content="Check Dongle" Click="OnCheckDongleClicked"
+                                MinWidth="110"/>
                     </StackPanel>
                 </Grid>
 
@@ -118,7 +120,7 @@
                         </StackPanel>
                     </Border>
                 </Grid>
-                <Grid ColumnDefinitions="Auto,*,*,Auto" ColumnSpacing="4">
+                <Grid ColumnDefinitions="Auto,*,*,Auto,Auto,Auto,Auto" ColumnSpacing="4">
                     <Border Grid.Column="0" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1" CornerRadius="4" Padding="8">
                         <StackPanel>
@@ -127,6 +129,8 @@
                                       Click="OnDebugLogToggled"/>
                             <CheckBox x:Name="BinDataBox" Content="Enable Debug Bin Data" IsChecked="True"
                                       Click="OnBinDataToggled"/>
+                            <CheckBox x:Name="DongleDebugBox" Content="Enable debug dongle" IsChecked="True"
+                                      Click="OnDongleDebugToggled"/>
                         </StackPanel>
                     </Border>
                     <Border Grid.Column="1" HorizontalAlignment="Left" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
@@ -143,11 +147,32 @@
                             <VariableSizedWrapGrid Orientation="Horizontal" x:Name="FilterPanel"/>
                         </StackPanel>
                     </Border>
-                    <Border Grid.Column="3" x:Name="SampleRateSection" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    <Border Grid.Column="3" x:Name="SampleRateSection" Visibility="Collapsed" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                             BorderThickness="1" CornerRadius="4" Padding="8">
                         <StackPanel>
                             <TextBlock Text="EEG Sample Rate" FontWeight="SemiBold"/>
                             <StackPanel Orientation="Horizontal" x:Name="SampleRatePanel" Spacing="8"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Grid.Column="4" x:Name="EmgSampleRateSection" Visibility="Collapsed" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1" CornerRadius="4" Padding="8">
+                        <StackPanel>
+                            <TextBlock Text="EMG Sample Rate" FontWeight="SemiBold"/>
+                            <StackPanel Orientation="Horizontal" x:Name="EmgSampleRatePanel" Spacing="8"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Grid.Column="5" x:Name="ImuSampleRateSection" Visibility="Collapsed" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1" CornerRadius="4" Padding="8">
+                        <StackPanel>
+                            <TextBlock Text="IMU Sample Rate" FontWeight="SemiBold"/>
+                            <StackPanel Orientation="Horizontal" x:Name="ImuSampleRatePanel" Spacing="8"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Grid.Column="6" x:Name="PpgSampleRateSection" Visibility="Collapsed" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1" CornerRadius="4" Padding="8">
+                        <StackPanel>
+                            <TextBlock Text="PPG Sample Rate" FontWeight="SemiBold"/>
+                            <StackPanel Orientation="Horizontal" x:Name="PpgSampleRatePanel" Spacing="8"/>
                         </StackPanel>
                     </Border>
                 </Grid>
@@ -163,14 +188,41 @@
                     <Button x:Name="NextPageButton" Content="Next" Click="OnNextPage"/>
                 </StackPanel>
                 <TextBlock Grid.Row="1" x:Name="BioTitleText" Text="EMG / EEG Waveform"/>
-                <ctl:WaveformControl Grid.Row="2" x:Name="BioWave0" MinHeight="60"/>
-                <ctl:WaveformControl Grid.Row="3" x:Name="BioWave1" MinHeight="60"/>
-                <ctl:WaveformControl Grid.Row="4" x:Name="BioWave2" MinHeight="60"/>
-                <ctl:WaveformControl Grid.Row="5" x:Name="BioWave3" MinHeight="60"/>
-                <ctl:WaveformControl Grid.Row="6" x:Name="BioWave4" MinHeight="60"/>
-                <ctl:WaveformControl Grid.Row="7" x:Name="BioWave5" MinHeight="60"/>
-                <ctl:WaveformControl Grid.Row="8" x:Name="BioWave6" MinHeight="60"/>
-                <ctl:WaveformControl Grid.Row="9" x:Name="BioWave7" MinHeight="60"/>
+                <!-- Each row: left spectrum + right waveform, 50/50. The
+                     spectrum is collapsed unless LayoutBio binds a channel
+                     to the row (EMG/EEG modes only). -->
+                <Grid Grid.Row="2" x:Name="BioRow0" ColumnDefinitions="0,*">
+                    <ctl:SpectrumControl x:Name="BioSpec0" Visibility="Collapsed"/>
+                    <ctl:WaveformControl Grid.Column="1" x:Name="BioWave0" MinHeight="60"/>
+                </Grid>
+                <Grid Grid.Row="3" x:Name="BioRow1" ColumnDefinitions="0,*">
+                    <ctl:SpectrumControl x:Name="BioSpec1" Visibility="Collapsed"/>
+                    <ctl:WaveformControl Grid.Column="1" x:Name="BioWave1" MinHeight="60"/>
+                </Grid>
+                <Grid Grid.Row="4" x:Name="BioRow2" ColumnDefinitions="0,*">
+                    <ctl:SpectrumControl x:Name="BioSpec2" Visibility="Collapsed"/>
+                    <ctl:WaveformControl Grid.Column="1" x:Name="BioWave2" MinHeight="60"/>
+                </Grid>
+                <Grid Grid.Row="5" x:Name="BioRow3" ColumnDefinitions="0,*">
+                    <ctl:SpectrumControl x:Name="BioSpec3" Visibility="Collapsed"/>
+                    <ctl:WaveformControl Grid.Column="1" x:Name="BioWave3" MinHeight="60"/>
+                </Grid>
+                <Grid Grid.Row="6" x:Name="BioRow4" ColumnDefinitions="0,*">
+                    <ctl:SpectrumControl x:Name="BioSpec4" Visibility="Collapsed"/>
+                    <ctl:WaveformControl Grid.Column="1" x:Name="BioWave4" MinHeight="60"/>
+                </Grid>
+                <Grid Grid.Row="7" x:Name="BioRow5" ColumnDefinitions="0,*">
+                    <ctl:SpectrumControl x:Name="BioSpec5" Visibility="Collapsed"/>
+                    <ctl:WaveformControl Grid.Column="1" x:Name="BioWave5" MinHeight="60"/>
+                </Grid>
+                <Grid Grid.Row="8" x:Name="BioRow6" ColumnDefinitions="0,*">
+                    <ctl:SpectrumControl x:Name="BioSpec6" Visibility="Collapsed"/>
+                    <ctl:WaveformControl Grid.Column="1" x:Name="BioWave6" MinHeight="60"/>
+                </Grid>
+                <Grid Grid.Row="9" x:Name="BioRow7" ColumnDefinitions="0,*">
+                    <ctl:SpectrumControl x:Name="BioSpec7" Visibility="Collapsed"/>
+                    <ctl:WaveformControl Grid.Column="1" x:Name="BioWave7" MinHeight="60"/>
+                </Grid>
             </Grid>
         </Grid>
     </Grid>

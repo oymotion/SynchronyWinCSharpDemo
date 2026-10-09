@@ -1,11 +1,10 @@
 # C# Bindings for the sen_* Flat C API
 
 Thin managed bindings over the handle-based flat C API declared in
-`include/sen_capi.h` (45 `sen_*` functions, built into `sensor.dll`). The
-binding layer carries zero logic: error strings, subscription masks, and
-session recovery all live inside the SDK and match the Python SDK
-(SensorSDKPython) verbatim. The legacy polling-API binding
-(`cs/SensorSdk.cs`) is untouched and coexists with this one.
+`include/sen_capi.h` (46 `sen_*` functions, built into `sensor.dll`). The
+binding layer carries zero logic: error strings and session behavior live
+inside the SDK and surface unchanged. This is the
+only C# surface of the SDK.
 
 ## Files
 
@@ -28,18 +27,13 @@ directly into the consuming app (see `example_cs/`).
   dies when the data callback returns. The `SensorData` objects delivered by
   `DataReceived` are **lightweight borrowed views**: they copy only the
   metadata and read samples straight from the native pointer via the fixed
-  40-byte ABI offsets (`Marshal.ReadInt32` plus explicit-layout int/float
-  and long/double unions — `BitConverter.Int32BitsToSingle` /
-  `Int64BitsToDouble` do not exist on
-  .NET Framework 4.8) — no per-sample
-  marshalling anywhere in the data path. A borrowed `SensorData` is valid
-  only until the handler returns; call `SensorData.Clone()` inside the
-  handler to keep a batch. `Clone()` detaches the payload with **one block
-  copy** (`Marshal.Copy` of `channelCount * sampleCount * 40` bytes) into a
-  flat `byte[]`; both backings share the same offset-based read path, so
-  every accessor works identically on borrowed and owned instances.
-  Managed `Sample` POCOs are only constructed on demand by
-  `GetChannelSample`.
+  40-byte ABI offsets — no per-sample marshalling anywhere in the data path.
+  A borrowed `SensorData` is valid only until the handler returns; call
+  `SensorData.Clone()` inside the handler to keep a batch. `Clone()`
+  detaches the payload with **one block copy** (`channelCount * sampleCount
+  * 40` bytes) into a flat `byte[]`; every accessor works identically on
+  borrowed and owned instances. Managed `Sample` objects are only
+  constructed on demand by `GetChannelSample`.
 - **Sample accessors** (`SensorData`, all offset-based direct reads, no
   object materialization except `GetChannelSample`): `GetData`,
   `GetTimeStampInMs` (computed: `sampleIndex * 1000 / SampleRate`, 0 when
@@ -51,8 +45,8 @@ directly into the consuming app (see `example_cs/`).
   Exception contract (single-slot accessors): only the index ranges are
   validated — an out-of-range channel/sampleIndex throws
   `ArgumentOutOfRangeException`. Staleness detection is **not** repeated by
-  the accessors: probe `IsDataValid(ch, i)` first (mirrors C++
-  `SensorData::isDataValid`) — false on out-of-range, missing payload, a
+  the accessors: probe `IsDataValid(ch, i)` first — false on out-of-range,
+  missing payload, a
   **stale slot** (stored sampleIndex != `StartSampleIndex + sampleIndex` —
   overwritten by newer data, or a zeroed masked-out channel) or a view from
   a **previous stream session** (its `StartTimeStamp` snapshot no longer
@@ -106,9 +100,39 @@ string value  = await profile.GetParamAsync("NTF_EMG");
 
 A non-empty SDK `errorMsg` faults the task with a `SensorException` whose
 message is the verbatim SDK string (e.g. `"Error: Please connect first"`).
-`GetParamAsync` resolves with the value-or-error string itself (Python
-`getParam` parity — error strings like `"Error: Not supported"` are values,
-not exceptions).
+`GetParamAsync` resolves with the value-or-error string itself (error
+strings like `"Error: Not supported"` are values, not exceptions).
+
+## Blocking sync methods
+
+Every async operation also has a blocking counterpart that returns the
+result directly (with a backstop timeout; on timeout bool/int/DeviceInfo
+methods return `false` / `-1` / `null`, string methods return
+`"Error: Timeout"`):
+
+```csharp
+bool ok = profile.Connect();
+ok = profile.Init(15, powerRefreshIntervalMs: 60000);
+ok = profile.StartDataNotification();
+string result = profile.SetParam("NTF_EMG", "ON");
+string value  = profile.GetParam("NTF");
+var devices = ctrl.Scan(4000);
+string csv = ctrl.ParseBinToCsv(binPath, csvPath);
+```
+
+`GetDeviceInfo()` is a local-cache read instead of a blocking operation
+(see below). `GetBatteryLevel()` returns the last battery level the SDK
+pushed (`PowerChanged`) or that `GetBatteryLevel[Async]` reported; with no
+reading yet it fetches one from the device (blocking, like the other sync
+forms), `-1` on failure.
+
+A faulted async operation surfaces in the sync form as the failure value
+(string forms return the verbatim SDK error string). The sync methods
+throw `InvalidOperationException` when called from a thread that delivers
+SDK callbacks (the binding registers every callback thread): an
+operation's completion is delivered on an SDK thread, so blocking one can
+deadlock its delivery. Use `Task.Run(() => profile.Connect())` or the
+async forms inside callbacks instead.
 
 ## Quick start
 
@@ -117,7 +141,7 @@ using SensorSdk;
 using SensorSdk.Capi;
 
 var ctrl = SensorController.Instance;
-ctrl.SetDebugEnabled(true);
+_ = ctrl.SetParamAsync("DEBUG_ENABLED", "True");
 Console.WriteLine(ctrl.GetVersion());
 
 ctrl.DeviceFound += devices => { /* SDK thread */ };
@@ -140,9 +164,34 @@ Offline (no device needed):
 
 ```csharp
 BinFileInfo? info = ctrl.GetBinFileInfo(binPath);
-string csvOrError = ctrl.ParseBinToCsv(binPath, csvPath);   // blocking
+string csvOrError = await ctrl.ParseBinToCsvAsync(binPath, csvPath);
 SensorProfile? replay = ctrl.ReplayBinFile(binPath, info?.Mac ?? "", realtime: false);
+var sensors = binMacs.Select(mac => ctrl.RequireSensor(mac)).ToArray();
+SensorProfile?[] members = ctrl.MultiReplayBinFile(binPaths, sensors, realtime: true);
 ```
+
+`MultiReplayBinFile(paths, sensors, realtime, timeoutMs)` starts a synchronized
+group replay: it takes one `SensorProfile` per bin path (the profile only
+supplies the device address — `ctrl.RequireSensor(mac)` is sufficient) and
+returns an input-order-aligned array with `null` for members that failed
+validation. `BinFileInfo.ConfigVersion` reports the version of the capture's
+CONFIG record (0 when the file carries no decodable config record). The same
+CONFIG record also fills `BinFileInfo.ChipType`, the device-class flags
+`IsUniversalStream` / `IsNewEmg` / `IsContainQat6` / `PpgModel`, the capture's
+`FeatureMap` / `NotifyDataFlag` bitmasks, and `SensorDatas` — one
+`BinSensorDataConfig` per configured stream (sample rate, `K`, channel
+mask/count, data type, package geometry, resolution and raw-data bias),
+listing only the entries the capture actually configured.
+
+`SensorProfile.GetDeviceInfo()` returns a binding-side cached
+`DeviceInfo`: the cache is fed by the `DeviceInfoUpdated` event and by
+`FetchDeviceInfo`/`FetchDeviceInfoAsync` results, and while empty one
+native read populates it; it answers `null` only before the profile was
+successfully initialized (a successful `Init`/`InitAsync`, or a replay
+configuration loaded by `ReplayBinFile`/`MultiReplayBinFile`; the
+`HasInited` property reports the same state), and it is cleared when the
+device disconnects. The `Device` property is likewise cached after the
+first read.
 
 `SensorController.Instance` is a process-wide singleton
 (`sen_controller_create`); call `TearDown()` (or `Dispose()`) at shutdown to
