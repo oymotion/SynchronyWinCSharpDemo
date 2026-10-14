@@ -264,7 +264,7 @@ values in order -> `StartDataNotificationAsync`. Explicit user calls
 cancel the pending resume.
 
 ```csharp
-sensorProfile.SetAutoReconnect(true);   // default; false to opt out
+sensorProfile.AutoReconnect = true;   // default; false to opt out
 ```
 
 **Custom recovery via `OnAutoReconnect`**: when the auto-reconnect finds the
@@ -683,7 +683,9 @@ Entries are tagged `[App]` in the log files. Never throws.
   pushed by the SDK polling).
 - **Settings**: Packet Loss Stats, Gesture box, Enable SDK Debug Log /
   Enable Debug Bin Data (the session's logs and .bin exports land in one
-  timestamped subdir of `Documents/sensorsdklog`), Data Notification
+  timestamped subdir of `Documents/sensorsdklog`), Translate IMU (on by
+  default; on = IMU arrives as separate ACC/GYRO/Euler/Quat streams, off =
+  the aggregate NTF_IMU stream), Data Notification
   switches (EEG/IMPE/EMG/GESTURE/PPG/SpO2/IMU/Angle, capability-gated by the device
   info), Filter switches (50Hz/60Hz/HPF/LPF), EEG Sample Rate radios
   (250/500/1000/2000 Hz, capability-gated by `EEG_SAMPLE_RATE_LIST`),

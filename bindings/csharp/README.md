@@ -74,6 +74,12 @@ All events (`DataReceived`, `StateChanged`, `ErrorReceived`, `PowerChanged`,
 caller's UI thread. Do not call blocking SDK functions from inside an event
 handler; marshal to your own thread if you need to.
 
+`ErrorReceived` also fires for every failed profile operation, alongside the
+operation's own result: `Connect` / `Init` / `StartDataNotification` /
+`StopDataNotification` returning false, `SetParam` / `GetParam` answering an
+"Error..."/"ERROR..." string, `GetBatteryLevel` returning -1, and a failed
+`FetchDeviceInfo` each report the SDK's failure reason there.
+
 `SensorProfile.OnAutoReconnect` (a settable delegate, not an event) gates
 stream recovery after an abnormal disconnect: it receives
 `(profile, hasLastSession, answer)` and answers asynchronously through the
@@ -81,7 +87,9 @@ passed `Action<bool>` — call it exactly once, from any thread, at any later
 time. `answer(true)` = the app takes over recovery itself and the SDK skips
 its default flow; `answer(false)` (the default when the delegate is unset,
 or when no answer arrives within 10 s) = the SDK runs its default recovery
-(reconnect, init replay, setParam replay, stream restart).
+(reconnect, init replay, setParam replay, stream restart). The flag itself
+reads back through the `AutoReconnect` property (native default ON; its
+setter is the existing `SetAutoReconnect`).
 
 ## Async model
 
@@ -134,6 +142,23 @@ operation's completion is delivered on an SDK thread, so blocking one can
 deadlock its delivery. Use `Task.Run(() => profile.Connect())` or the
 async forms inside callbacks instead.
 
+## Controller parameters
+
+`ctrl.GetParamAsync(key)` / `ctrl.SetParamAsync(key, value)` manage the
+SDK-wide settings: `DEBUG_ENABLED` / `DATA_LOG_ENABLED` / `LOG_PATH`
+(file logging), `BLE_TRACE_ENABLED` (per-packet dongle trace, default off),
+`BIN_RECORDER_ENABLED` (per-session bin capture master switch, default on —
+when off no capture file is opened at all), `BIN_RECORDER_MIN_FREE_PERCENT`
+(0-100, default 10 — the capture is skipped when the target drive's free
+space drops below this percentage of its capacity, a 100 MB absolute floor
+always applies), `TRANSLATE_IMU` ("True"/"False", default on — when on,
+the IMU data of new-EMG devices arrives as the separate ACC/GYRO/EULER/QUAT
+streams; when off, as the single aggregate NTF_IMU stream), `BACK_END` (read the active BLE backend; set forces one
+while BLE is idle), and the timeout/reconnect tunables `CMD_TIMEOUT_MS` /
+`CONNECT_TIMEOUT_MS` / `REPLAY_DELEGATE_WAIT_MS` / `RECONNECT_MAX_ATTEMPTS`
+/ `RECONNECT_DELAY_MS`. Leftover temp capture files from a crashed session
+are removed automatically at startup once untouched for over 24 hours.
+
 ## Quick start
 
 ```csharp
@@ -147,7 +172,8 @@ Console.WriteLine(ctrl.GetVersion());
 ctrl.DeviceFound += devices => { /* SDK thread */ };
 ctrl.StartScan(3000);
 // ...
-var profile = ctrl.RequireSensor(device);
+var profile = ctrl.RequireSensor(device);   // profile.Device mirrors this
+                                            // device instance (incl. RSSI)
 profile.DataReceived += (p, batch) =>
 {
     // batch items borrow SDK memory - handler scope only.

@@ -271,7 +271,7 @@ namespace SensorSdk.Capi
 #endif
         private const CallingConvention Cc = CallingConvention.Cdecl;
 
-        internal const uint ExpectedCapiVersion = 20;
+        internal const uint ExpectedCapiVersion = 21;
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_terminate();
@@ -464,6 +464,9 @@ namespace SensorSdk.Capi
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_profile_set_auto_reconnect(IntPtr profile, int enabled);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        internal static extern int sen_profile_get_auto_reconnect(IntPtr profile);
 
         [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
         internal static extern void sen_profile_log(

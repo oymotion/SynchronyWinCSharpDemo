@@ -131,6 +131,8 @@
                                       Click="OnBinDataToggled"/>
                             <CheckBox x:Name="DongleDebugBox" Content="Enable debug dongle" IsChecked="True"
                                       Click="OnDongleDebugToggled"/>
+                            <CheckBox x:Name="TranslateImuBox" Content="Translate IMU (split ACC/GYRO/EULER/QUAT)"
+                                      IsChecked="True" Click="OnTranslateImuToggled"/>
                         </StackPanel>
                     </Border>
                     <Border Grid.Column="1" HorizontalAlignment="Left" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"

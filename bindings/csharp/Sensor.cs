@@ -611,6 +611,11 @@ namespace SensorSdk
             }
         }
 
+        internal void PrimeDeviceCache(BleDevice device)
+        {
+            if (!_bleDeviceCache.HasValue) _bleDeviceCache = device;
+        }
+
         public SenDeviceState DeviceState => (SenDeviceState)Native.sen_profile_get_state(Handle);
         public bool IsReady => DeviceState == SenDeviceState.Ready;
         public bool HasInited => Native.sen_profile_has_init(Handle) != 0;
@@ -759,8 +764,11 @@ namespace SensorSdk
                 (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000, null!);
         }
 
-        public void SetAutoReconnect(bool enabled)
-            => Native.sen_profile_set_auto_reconnect(Handle, enabled ? 1 : 0);
+        public bool AutoReconnect
+        {
+            get => Native.sen_profile_get_auto_reconnect(Handle) != 0;
+            set => Native.sen_profile_set_auto_reconnect(Handle, value ? 1 : 0);
+        }
 
         public void Log(string message, string level = "I")
         {
@@ -1411,7 +1419,12 @@ namespace SensorSdk
             }
         }
 
-        public SensorProfile? RequireSensor(BleDevice device) => RequireSensor(device.Mac);
+        public SensorProfile? RequireSensor(BleDevice device)
+        {
+            SensorProfile? profile = RequireSensor(device.Mac);
+            profile?.PrimeDeviceCache(device);
+            return profile;
+        }
 
         public SensorProfile? RequireSensor(string mac)
         {
@@ -1512,7 +1525,7 @@ namespace SensorSdk
             return SyncWait.Await(
                 MultiStartDataNotificationAsync(sensors, timeoutMs,
                     maxDelayDispersionMs, maxAttempts, errors),
-                (timeoutMs > 0 ? timeoutMs : 60000) + 45000, new Dictionary<string, bool>());
+                (timeoutMs > 0 ? timeoutMs : 60000) + 10000, new Dictionary<string, bool>());
         }
 
         public Dictionary<string, bool> MultiStopDataNotification(
@@ -1522,7 +1535,7 @@ namespace SensorSdk
             CallbackGuard.ThrowOnSdkCallbackThread();
             return SyncWait.Await(
                 MultiStopDataNotificationAsync(sensors, timeoutMs, errors),
-                timeoutMs + 45000, new Dictionary<string, bool>());
+                timeoutMs + 10000, new Dictionary<string, bool>());
         }
 
         private static IntPtr[] CollectHandles(IReadOnlyList<SensorProfile> sensors)

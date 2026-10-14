@@ -21,7 +21,7 @@ public sealed partial class MainWindow : Window
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
     private const int FftUpdateIntervalMs = 200;
-    private const string DemoVersion = "0.1.37";
+    private const string DemoVersion = "0.1.40";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
@@ -512,7 +512,7 @@ public sealed partial class MainWindow : Window
 
         SensorProfile profile = _ctrl.RequireSensor(mac)!;
         HookProfileEvents(profile);
-        profile.SetAutoReconnect(AutoReconnectBox.IsChecked == true);
+        profile.AutoReconnect = AutoReconnectBox.IsChecked == true;
 
         var st = new DeviceState(profile) { Name = name };
         st.LiveFilterState.SetBand(FilterCombo.SelectedIndex);
@@ -1226,6 +1226,14 @@ public sealed partial class MainWindow : Window
         ApplyDongleDebug();
     }
 
+    private async void OnTranslateImuToggled(object sender, RoutedEventArgs e)
+    {
+        string value = TranslateImuBox.IsChecked == true ? "True" : "False";
+        AppLog($"User: translate IMU {value}");
+        string result = await _ctrl.SetParamAsync("TRANSLATE_IMU", value);
+        AppLog($"App: setParam(TRANSLATE_IMU, {value}) -> {result}");
+    }
+
     private List<DeviceState> SnapshotStates()
     {
         lock (_statesMutex)
@@ -1302,7 +1310,7 @@ public sealed partial class MainWindow : Window
         bool isChecked = AutoReconnectBox.IsChecked == true;
         AppLog($"User: auto reconnect {(isChecked ? "ON" : "OFF")}");
         foreach (DeviceState st in SnapshotStates())
-            st.Profile.SetAutoReconnect(isChecked);
+            st.Profile.AutoReconnect = isChecked;
     }
 
     // ------------------------------------------------------------------
@@ -2145,6 +2153,7 @@ public sealed partial class MainWindow : Window
         DebugLogBox.IsEnabled = !replaying;
         BinDataBox.IsEnabled = !replaying;
         DongleDebugBox.IsEnabled = !replaying;
+        TranslateImuBox.IsEnabled = !replaying;
         ReplayButton.IsEnabled = !replaying;
         MultiReplayButton.IsEnabled = !replaying;
         ReplayPauseButton.IsEnabled = replaying;
