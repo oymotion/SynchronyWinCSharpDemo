@@ -7,9 +7,9 @@ OYMotion SDK demo for C# / .NET.
 Full-featured multi-device GUI demo over the C# bindings in
 `bindings/csharp/` (`SensorCapi.cs` + `Sensor.cs`, compiled into the app by
 path), built against the **prebuilt** `sensor.dll` from
-`lib/windows/<arch>/<config>/` (copied next to the exe at build time; x64
-Debug by default, selectable via the `SensorSdkArch` / `SensorSdkConfig`
-build properties). Feature parity with the Qt demo
+`lib/windows/<arch>/<config>/` (copied next to the exe at build time together
+with `sensor_ble_helper.exe`; x64 Debug by default, selectable via the
+`SensorSdkArch` / `SensorSdkConfig` build properties). Feature parity with the Qt demo
 (`example_qt`); the window title carries the SDK version and the demo's own
 version (bump +0.0.1 per demo change).
 
@@ -43,14 +43,14 @@ or open `example_cs_winui3/` in VS2022 (17.8+) with the "Windows App SDK"
 workload and press F5.
 
 `export_standalone.bat [target_dir]` copies the demo as a standalone project
-(demo sources + the C# binding sources + the Release `sensor.dll` for x64 and
-x86, preserving the relative layout) so it can be handed out without the SDK
-repository; the exported project defaults to the Release SDK library on any
-configuration.
+(demo sources + the C# binding sources + the Release `sensor.dll` and
+`sensor_ble_helper.exe` for x64 and x86, preserving the relative layout) so it
+can be handed out without the SDK repository; the exported project defaults to
+the Release SDK library on any configuration.
 
 To use the bindings in your own app, add `bindings/csharp/SensorCapi.cs` and
-`bindings/csharp/Sensor.cs` to your project and ship `sensor.dll` next to
-the exe (support matrix: net8 / net48 / netstandard2.1 / Unity IL2CPP — see
+`bindings/csharp/Sensor.cs` to your project and ship `sensor.dll` and
+`sensor_ble_helper.exe` next to the exe (support matrix: net8 / net48 / netstandard2.1 / Unity IL2CPP — see
 `bindings/csharp/README.md`).
 
 ## 1. Permission
@@ -97,8 +97,11 @@ also traced as a warning at controller creation).
 
 ### 2. Start scan
 
-Use `bool StartScan(int periodInMs)` to start scanning; `DeviceFound` fires
-every `periodInMs`:
+Use `bool StartScan(int periodInMs)` to start scanning. `periodInMs` sets the
+periodic summary interval, not a callback throttle. `DeviceFound` fires
+immediately when a new device is discovered to minimize discovery latency,
+and again each period with the current non-empty device list (including
+RSSI-only updates). Empty periodic summaries are skipped:
 
 ```csharp
 bool success = controller.StartScan(6000);
@@ -294,7 +297,7 @@ DeviceInfo deviceInfo = sensorProfile.GetDeviceInfo();
 
 // fields: DeviceName, ModelName, HardwareVersion, FirmwareVersion, MTUSize
 // plus a ChannelCount / SampleRate field pair per modality:
-//   Ppg, Spo2, Impe, Emg, Eeg, Ecg, Acc, Gyro, Brth, MagAngle, Euler, Quat
+//   Ppg, Spo2, Impe, Emg, Eeg, Ecg, Acc, Gyro, Brth, Angle, Euler, Quat, Mag
 // plus EmgMaxSampleRate / EegMaxSampleRate / EcgMaxSampleRate (maximum rate
 //   from the capability query, 0 = not reported)
 // plus ImuChannelCount / ImuSampleRate (aggregated IMU stream; 0 = none)
@@ -345,7 +348,8 @@ await sensorProfile.StartDataNotificationAsync();
 //   Quaternion = 0x5     // quaternion (w, x, y, z)
 //   Gest = 0x07          // gesture id
 //   Emg = 0x8            // unit is uV
-//   MagAngle = 0x0D
+//   Angle = 0x0D         // joint angle (magnetic rotary encoder)
+//   Mag = 0x3            // 3-axis magnetometer, unit is uT
 //   Eeg = 0x10           // unit is uV
 //   Ecg = 0x11           // unit is uV
 //   Impedance = 0x12     // electrode impedance
@@ -461,7 +465,7 @@ await sensorProfile.SetParamAsync("NTF_ECG", "ON");
 await sensorProfile.SetParamAsync("NTF_IMU", "ON");
 await sensorProfile.SetParamAsync("NTF_BRTH", "ON");
 await sensorProfile.SetParamAsync("NTF_IMPEDANCE", "ON");
-await sensorProfile.SetParamAsync("NTF_MAG_ANGLE", "ON");
+await sensorProfile.SetParamAsync("NTF_ANGLE", "ON");
 await sensorProfile.SetParamAsync("NTF_PPG", "ON");
 await sensorProfile.SetParamAsync("NTF_PPG_RAW", "ON");   // alias of NTF_PPG
 await sensorProfile.SetParamAsync("NTF_SPO2", "ON");
@@ -662,8 +666,10 @@ Entries are tagged `[App]` in the log files. Never throws.
   `OnAutoReconnect` query is answered with `true`, and once the link is
   back the demo re-runs the connect/init/stream chain and re-applies the
   recorded setParam history (results starting with "Error" are not
-  recorded); every disconnect tears the device UI state down
-  unconditionally.
+  recorded). Turning Auto Reconnect off declines app-driven recovery and
+  cancels later recovery stages at the next recovery-method entry check;
+  a method already in progress may finish. Manual Connect is unaffected.
+  Every disconnect tears the device UI state down unconditionally.
 - **Left column**: 3D quaternion cube, 2D waveform of the selected type
   (ACC / GYRO / Quat / Euler) with per-channel labels, an FFT spectrum strip
   below it (recomputed every 200 ms on a worker thread), and a real-time

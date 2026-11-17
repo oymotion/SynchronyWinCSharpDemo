@@ -109,11 +109,12 @@ public sealed class DeviceState
     public readonly object BufMutex = new();
     public readonly RingBuffer Acc = new();
     public readonly RingBuffer Gyro = new();
+    public readonly RingBuffer Mag = new();
     public readonly RingBuffer Emg = new();
     public readonly RingBuffer Eeg = new();
     public readonly RingBuffer Ecg = new();
     public readonly RingBuffer Brth = new();
-    public readonly RingBuffer MagAngle = new();
+    public readonly RingBuffer Angle = new();
     public readonly RingBuffer Ppg = new();
     public readonly RingBuffer Spo2 = new();
     public readonly RingBuffer Quat = new();
@@ -168,8 +169,8 @@ public sealed class DeviceState
             return BioKind.PPG;
         if (Info.EEGChannelCount > 0 || Eeg.Allocated)
             return BioKind.EEG;
-        if (Info.EMGChannelCount > 0 || Info.MagAngleChannelCount > 0
-            || Emg.Allocated || MagAngle.Allocated)
+        if (Info.EMGChannelCount > 0 || Info.AngleChannelCount > 0
+            || Emg.Allocated || Angle.Allocated)
             return BioKind.EMG;
         return BioKind.None;
     }
@@ -216,6 +217,7 @@ public sealed class DeviceState
         {
             case SenDataType.Acc: target = Acc; break;
             case SenDataType.Gyro: target = Gyro; break;
+            case SenDataType.Mag: target = Mag; break;
             case SenDataType.Quaternion: target = Quat; break;
             case SenDataType.Euler: target = Euler; break;
             case SenDataType.Gest:
@@ -245,8 +247,8 @@ public sealed class DeviceState
                 target = Ecg; impedance = EcgImpedance; seconds = BioBufferSeconds; break;
             case SenDataType.Brth:
                 target = Brth; impedance = BrthImpedance; seconds = BioBufferSeconds; break;
-            case SenDataType.MagAngle:
-                target = MagAngle; seconds = BioBufferSeconds; break;
+            case SenDataType.Angle:
+                target = Angle; seconds = BioBufferSeconds; break;
         }
         if (target == null)
             return;
@@ -366,8 +368,8 @@ public sealed class DeviceState
     {
         lock (BufMutex)
         {
-            Acc.Clear(); Gyro.Clear(); Emg.Clear(); Eeg.Clear(); Ecg.Clear();
-            Brth.Clear(); MagAngle.Clear(); Ppg.Clear(); Spo2.Clear(); Quat.Clear(); Euler.Clear();
+            Acc.Clear(); Gyro.Clear(); Mag.Clear(); Emg.Clear(); Eeg.Clear(); Ecg.Clear();
+            Brth.Clear(); Angle.Clear(); Ppg.Clear(); Spo2.Clear(); Quat.Clear(); Euler.Clear();
             Fill(EmgImpedance, -1.0f);
             Fill(EegImpedance, -1.0f);
             Fill(EcgImpedance, -1.0f);
@@ -433,7 +435,8 @@ public sealed class DeviceState
         ((int)SenDataType.Ecg, "ECG"),
         ((int)SenDataType.Brth, "BRTH"),
         ((int)SenDataType.Gest, "GEST"),
-        ((int)SenDataType.MagAngle, "Angle"),
+        ((int)SenDataType.Mag, "MAG"),
+        ((int)SenDataType.Angle, "Angle"),
     ];
 
     public string BuildStatusText()
@@ -486,11 +489,12 @@ public sealed class DeviceState
     {
         SenDataType.Acc => "ACC",
         SenDataType.Gyro => "GYRO",
+        SenDataType.Mag => "MAG",
         SenDataType.Euler => "EULER",
         SenDataType.Quaternion => "QUAT",
         SenDataType.Gest => "GEST",
         SenDataType.Emg => "EMG",
-        SenDataType.MagAngle => "Angle",
+        SenDataType.Angle => "Angle",
         SenDataType.Eeg => "EEG",
         SenDataType.Ppg => "PPG",
         SenDataType.Spo2 => "SPO2",

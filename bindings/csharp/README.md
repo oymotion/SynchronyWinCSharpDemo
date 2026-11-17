@@ -70,15 +70,21 @@ directly into the consuming app (see `example_cs/`).
 ## Threading
 
 All events (`DataReceived`, `StateChanged`, `ErrorReceived`, `PowerChanged`,
-`DeviceFound`, `EnableChanged`) fire on internal SDK threads — never on the
-caller's UI thread. Do not call blocking SDK functions from inside an event
-handler; marshal to your own thread if you need to.
+`DeviceFound`, `EnableChanged`, `ScanStateChanged`) fire on internal SDK threads
+— never on the caller's UI thread. Do not call blocking SDK functions from
+inside an event handler; marshal to your own thread if you need to.
 
-`ErrorReceived` also fires for every failed profile operation, alongside the
-operation's own result: `Connect` / `Init` / `StartDataNotification` /
-`StopDataNotification` returning false, `SetParam` / `GetParam` answering an
-"Error..."/"ERROR..." string, `GetBatteryLevel` returning -1, and a failed
-`FetchDeviceInfo` each report the SDK's failure reason there.
+`ScanStateChanged(bool isScanning, string errorMsg)` reports backend scan
+start/stop, failure (including no free dongle), and recovery notifications.
+
+`ErrorReceived` also fires for every failed profile operation EXCEPT
+`SetParam` / `GetParam`, alongside the operation's own result: `Connect` /
+`Init` / `StartDataNotification` / `StopDataNotification` returning false,
+`GetBatteryLevel` returning -1, and a failed `FetchDeviceInfo` each report
+the SDK's failure reason there. Param operations report failures only
+through their own result, and a failure always fills the errorMsg slot too
+(a failure carried only in the result string, e.g. an all-caps
+"ERROR: ..." command outcome, is mirrored into errorMsg).
 
 `SensorProfile.OnAutoReconnect` (a settable delegate, not an event) gates
 stream recovery after an abnormal disconnect: it receives
@@ -87,9 +93,13 @@ passed `Action<bool>` — call it exactly once, from any thread, at any later
 time. `answer(true)` = the app takes over recovery itself and the SDK skips
 its default flow; `answer(false)` (the default when the delegate is unset,
 or when no answer arrives within 10 s) = the SDK runs its default recovery
-(reconnect, init replay, setParam replay, stream restart). The flag itself
-reads back through the `AutoReconnect` property (native default ON; its
-setter is the existing `SetAutoReconnect`).
+(reconnect, init replay, setParam replay, stream restart). The
+`AutoReconnect` property reads or writes the flag (native default ON).
+Setting it to false disables both link auto-reconnection and session recovery
+(init replay, setParam replay, and data-stream restart); the
+`OnAutoReconnect` handler cannot override the disabled switch. The read-only
+`IsAutoReconnecting` property reports native reconnect/session-recovery activity
+and returns false after recovery, cancellation, or budget exhaustion.
 
 ## Async model
 
@@ -108,15 +118,16 @@ string value  = await profile.GetParamAsync("NTF_EMG");
 
 A non-empty SDK `errorMsg` faults the task with a `SensorException` whose
 message is the verbatim SDK string (e.g. `"Error: Please connect first"`).
-`GetParamAsync` resolves with the value-or-error string itself (error
-strings like `"Error: Not supported"` are values, not exceptions).
+`GetParamAsync` / `SetParamAsync` also fault on an `"Error..."` / `"ERROR:..."`
+result, so successful tasks resolve only normal values. Their blocking forms
+throw the same `SensorException` on SDK errors and timeouts.
 
 ## Blocking sync methods
 
 Every async operation also has a blocking counterpart that returns the
-result directly (with a backstop timeout; on timeout bool/int/DeviceInfo
-methods return `false` / `-1` / `null`, string methods return
-`"Error: Timeout"`):
+result directly. On timeout, bool/int/DeviceInfo methods return
+`false` / `-1` / `null`, parameter methods throw `SensorException`, and other
+string methods return `"Error: Timeout"`:
 
 ```csharp
 bool ok = profile.Connect();
@@ -136,21 +147,23 @@ forms), `-1` on failure.
 
 A faulted async operation surfaces in the sync form as the failure value
 (string forms return the verbatim SDK error string). The sync methods
-throw `InvalidOperationException` when called from a thread that delivers
-SDK callbacks (the binding registers every callback thread): an
-operation's completion is delivered on an SDK thread, so blocking one can
-deadlock its delivery. Use `Task.Run(() => profile.Connect())` or the
-async forms inside callbacks instead.
+throw `InvalidOperationException` while an SDK callback is active on the
+calling thread: an operation's completion is delivered on an SDK thread, so
+blocking one can deadlock its delivery. The guard is callback-scoped and is
+cleared when the callback returns, including nested callbacks. Use
+`Task.Run(() => profile.Connect())` or the async forms inside callbacks
+instead.
 
 ## Controller parameters
 
 `ctrl.GetParamAsync(key)` / `ctrl.SetParamAsync(key, value)` manage the
 SDK-wide settings: `DEBUG_ENABLED` / `DATA_LOG_ENABLED` / `LOG_PATH`
 (file logging), `BLE_TRACE_ENABLED` (per-packet dongle trace, default off),
-`BIN_RECORDER_ENABLED` (per-session bin capture master switch, default on —
-when off no capture file is opened at all), `BIN_RECORDER_MIN_FREE_PERCENT`
-(0-100, default 10 — the capture is skipped when the target drive's free
-space drops below this percentage of its capacity, a 100 MB absolute floor
+`DEFAULT_BIN_RECORDER_ENABLED` (default MAC temp capture switch, default off —
+`DEBUG_BLE_DATA_PATH` takes precedence and enables direct capture independently;
+without it, off disables the default temp capture), `BIN_RECORDER_MIN_FREE_PERCENT`
+(0-100, default 0 — the capture is skipped when the target drive's free
+space drops below this percentage of its capacity, a 2 GiB absolute floor
 always applies), `TRANSLATE_IMU` ("True"/"False", default on — when on,
 the IMU data of new-EMG devices arrives as the separate ACC/GYRO/EULER/QUAT
 streams; when off, as the single aggregate NTF_IMU stream), `BACK_END` (read the active BLE backend; set forces one
@@ -160,6 +173,12 @@ while BLE is idle), and the timeout/reconnect tunables `CMD_TIMEOUT_MS` /
 are removed automatically at startup once untouched for over 24 hours.
 
 ## Quick start
+
+For continuous scanning, `periodInMs` sets the periodic summary interval, not
+a callback throttle. `DeviceFound` fires immediately when a new device is
+discovered to minimize discovery latency, and again each period with the
+current non-empty device list (including RSSI-only updates). Empty periodic
+summaries are skipped.
 
 ```csharp
 using SensorSdk;

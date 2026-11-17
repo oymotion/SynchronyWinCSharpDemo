@@ -21,12 +21,12 @@ public sealed partial class MainWindow : Window
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
     private const int FftUpdateIntervalMs = 200;
-    private const string DemoVersion = "0.1.40";
+    private const string DemoVersion = "0.1.53";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
 
-    private static readonly string[] NtfKeys = ["NTF_EEG", "NTF_IMPEDANCE", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU", "NTF_MAG_ANGLE"];
+    private static readonly string[] NtfKeys = ["NTF_EEG", "NTF_IMPEDANCE", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU", "NTF_ANGLE"];
     private static readonly string[] FilterKeys = ["FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF"];
     private static readonly int[] SampleRateCandidates = [250, 500, 1000, 2000];
     private static readonly int[] EmgSampleRateCandidates = [500, 1000];
@@ -36,7 +36,7 @@ public sealed partial class MainWindow : Window
     {
         ["NTF_EEG"] = "EEG", ["NTF_IMPEDANCE"] = "IMPE", ["NTF_EMG"] = "EMG",
         ["NTF_GEST"] = "GESTURE", ["NTF_PPG"] = "PPG", ["NTF_SPO2"] = "SpO2",
-        ["NTF_IMU"] = "IMU", ["NTF_MAG_ANGLE"] = "Angle",
+        ["NTF_IMU"] = "IMU", ["NTF_ANGLE"] = "Angle",
     };
     private static readonly Dictionary<string, string> FilterLabels = new()
     {
@@ -68,7 +68,8 @@ public sealed partial class MainWindow : Window
     private readonly Dictionary<string, string> _lastDataPaths = new();
     private bool _debugLogEnabled = true;
     private bool _binDataEnabled = true;
-    private bool _dongleDebugEnabled = true;
+    private bool _dongleDebugEnabled = false;
+    private bool _autoReconnect = true;
 
     private bool _updatingControls;
     private bool _shuttingDown;
@@ -236,9 +237,9 @@ public sealed partial class MainWindow : Window
         _dataWorker.Start();
 
         if (_debugLogEnabled)
-            ApplySdkDebugLog();
+            _ = ApplySdkDebugLog();
 
-        ApplyDongleDebug();
+        _ = ApplyDongleDebug();
 
         _plotTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(PlotUpdateIntervalMs) };
         _plotTimer.Tick += (_, _) => OnPlotTick();
@@ -297,7 +298,7 @@ public sealed partial class MainWindow : Window
         catch { }
     }
 
-    private async void ShowWarning(string title, string message)
+    private async Task ShowWarning(string title, string message)
     {
         if (_dialogOpen || Content.XamlRoot == null)
             return;
@@ -313,7 +314,10 @@ public sealed partial class MainWindow : Window
             };
             await dlg.ShowAsync();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine("[DemoWinUI3] warning dialog failed: " + ex.Message);
+        }
         finally { _dialogOpen = false; }
     }
 
@@ -540,13 +544,22 @@ public sealed partial class MainWindow : Window
         profile.OnAutoReconnect = (p, hasLastSession, answer) =>
         {
             p.Log("App: auto reconnect callback received, restore=" + (hasLastSession ? "True" : "False"));
-            Post(() => RecoverDevice(mac, hasLastSession));
+            if (!_autoReconnect || !p.AutoReconnect)
+            {
+                p.AutoReconnect = false;
+                answer(false);
+                return;
+            }
+            Post(async () => await RecoverDevice(mac, hasLastSession));
             answer(true);
         };
     }
 
-    private async void RecoverDevice(string mac, bool restore)
+    private async Task RecoverDevice(string mac, bool restore)
     {
+        SensorProfile? profile = _ctrl.GetSensor(mac);
+        if (profile == null)
+            return;
         // App-driven recovery: re-select the row and re-run the connect
         // chain; the recorded setParam history replays after the stream
         // start.
@@ -558,11 +571,6 @@ public sealed partial class MainWindow : Window
             if (_deviceStates.ContainsKey(mac))
                 return;
         }
-        SensorProfile? profile = _ctrl.GetSensor(mac);
-        if (profile == null)
-            return;
-        if (restore)
-            _restoreParamsMacs.Add(mac);
         string name = mac;
         foreach (DeviceEntry d in _discovered)
             if (d.Mac == mac) { name = d.Name; break; }
@@ -570,16 +578,41 @@ public sealed partial class MainWindow : Window
         st.LiveFilterState.SetBand(FilterCombo.SelectedIndex);
         lock (_statesMutex)
             _deviceStates[mac] = st;
+        if (AutoRecoveryCancelled(st, true))
+            return;
+        if (restore)
+            _restoreParamsMacs.Add(mac);
         _currentMac = mac;
         RetargetWaveforms();
         RefreshInfoPanel();
-        await RunConnectChain(st);
+        await RunConnectChain(st, true);
     }
 
-    private async Task RunConnectChain(DeviceState st)
+    private bool AutoRecoveryCancelled(DeviceState st, bool isAutoRecovery)
+    {
+        if (!isAutoRecovery || (_autoReconnect && st.Profile.AutoReconnect))
+            return false;
+        st.Profile.AutoReconnect = false;
+        if (st.Profile.DeviceState == SenDeviceState.Disconnected)
+        {
+            OnStateChanged(st.Mac, SenDeviceState.Disconnected);
+            return true;
+        }
+        if (st.Profile.IsDataTransfering)
+            _streamingMacs.Add(st.Mac);
+        else
+            _streamingMacs.Remove(st.Mac);
+        UpdateDeviceItemText(st.Mac, true);
+        UpdateButtonStates();
+        return true;
+    }
+
+    private async Task RunConnectChain(DeviceState st, bool isAutoRecovery = false)
     {
         try
         {
+            if (AutoRecoveryCancelled(st, isAutoRecovery))
+                return;
             if (!st.Profile.IsReady)
             {
                 bool ok = await st.Profile.ConnectAsync();
@@ -632,11 +665,11 @@ public sealed partial class MainWindow : Window
             st.FlowStarted = true;
             AppLog($"App: device connected and streaming: {st.Name} ({st.Mac})", "I", st);
             UpdateDeviceItemText(st.Mac, true);
-            await ApplySessionParams(st);
+            await ApplySessionParams(st, isAutoRecovery);
             if (_restoreParamsMacs.Remove(st.Mac))
-                await RestoreSavedParams(st);
+                await RestoreSavedParams(st, isAutoRecovery);
             else
-                RefreshControlStates(st);
+                await RefreshControlStates(st);
             if (_currentMac == st.Mac)
             {
                 RefreshInfoPanel();
@@ -666,7 +699,7 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void OnDisconnectClicked(object sender, RoutedEventArgs e)
+    private async void OnDisconnectClicked(object sender, RoutedEventArgs e)
     {
         DeviceState? st = CurrentState();
         if (st == null || st.IsReplay)
@@ -692,7 +725,16 @@ public sealed partial class MainWindow : Window
         DisconnectButton.IsEnabled = false;
         ConnectButton.IsEnabled = false;
         StatusText.Text = "Disconnecting...";
-        _ = st.Profile.DisconnectAsync();
+        try
+        {
+            await st.Profile.DisconnectAsync();
+        }
+        catch (Exception ex)
+        {
+            AppLog($"App: disconnect failed on {st.Mac}: {ex.Message}", "E", st);
+            StatusText.Text = "Disconnect failed: " + ex.Message;
+            UpdateButtonStates();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -885,22 +927,16 @@ public sealed partial class MainWindow : Window
     // setParam / getParam controls
     // ------------------------------------------------------------------
 
-    private static (string msg, bool isError) SetParamOutcome(string result)
-    {
-        bool isError = result.StartsWith("Error") || result.StartsWith("ERROR:");
-        return (result, isError);
-    }
-
-    private async Task<(string msg, bool isError)> SendSetParam(SensorProfile profile, string key, string value)
+    private async Task<(string result, string error)> SendSetParam(SensorProfile profile, string key, string value)
     {
         try
         {
             string result = await profile.SetParamAsync(key, value, CmdTimeoutMs);
-            return SetParamOutcome(result);
+            return (result, "");
         }
-        catch (Exception ex)
+        catch (SensorException ex)
         {
-            return ("Error: " + ex.Message, true);
+            return ("", ex.Message);
         }
     }
 
@@ -912,16 +948,17 @@ public sealed partial class MainWindow : Window
         if (st == null || !st.Profile.IsReady)
             return;
         string value = cb.IsChecked == true ? "ON" : "OFF";
-        (string msg, bool isError) = await SendSetParam(st.Profile, key, value);
+        (string msg, string error) = await SendSetParam(st.Profile, key, value);
+        msg = error.Length > 0 ? error : msg;
         AppLog($"User: setParam({key}, {value}) -> {msg}");
-        RecordSavedParam(st.Mac, key, value, msg);
-        if (isError)
+        if (error.Length == 0) RecordSavedParam(st.Mac, key, value);
+        if (error.Length > 0)
         {
-            ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
-            RefreshControlStates(st);
+            await ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
+            await RefreshControlStates(st);
             return;
         }
-        RefreshControlStates(CurrentState());
+        await RefreshControlStates(CurrentState());
         ClearUiData();
     }
 
@@ -933,16 +970,17 @@ public sealed partial class MainWindow : Window
         if (st == null || !st.Profile.IsReady)
             return;
         string value = cb.IsChecked == true ? "ON" : "OFF";
-        (string msg, bool isError) = await SendSetParam(st.Profile, key, value);
+        (string msg, string error) = await SendSetParam(st.Profile, key, value);
+        msg = error.Length > 0 ? error : msg;
         AppLog($"User: setParam({key}, {value}) -> {msg}");
-        RecordSavedParam(st.Mac, key, value, msg);
-        if (isError)
+        if (error.Length == 0) RecordSavedParam(st.Mac, key, value);
+        if (error.Length > 0)
         {
-            ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
-            RefreshControlStates(st);
+            await ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
+            await RefreshControlStates(st);
             return;
         }
-        RefreshControlStates(CurrentState());
+        await RefreshControlStates(CurrentState());
         ClearUiData();
     }
 
@@ -968,46 +1006,48 @@ public sealed partial class MainWindow : Window
         if (st == null || !st.Profile.IsReady)
             return;
         string value = rate.ToString();
-        (string msg, bool isError) = await SendSetParam(st.Profile, key, value);
+        (string msg, string error) = await SendSetParam(st.Profile, key, value);
+        msg = error.Length > 0 ? error : msg;
         AppLog($"User: setParam({key}, {value}) -> {msg}");
-        RecordSavedParam(st.Mac, key, value, msg);
-        if (isError)
+        if (error.Length == 0) RecordSavedParam(st.Mac, key, value);
+        if (error.Length > 0)
         {
-            ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
-            RefreshControlStates(st);
+            await ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
+            await RefreshControlStates(st);
             return;
         }
-        RefreshControlStates(CurrentState());
+        await RefreshControlStates(CurrentState());
         ClearUiData();
     }
 
-    private static async Task<string> SafeGetParam(SensorProfile profile, string key)
+    private static async Task<(string result, string error)> SafeGetParam(SensorProfile profile, string key)
     {
         try
         {
-            return await profile.GetParamAsync(key, 5000);
+            string result = await profile.GetParamAsync(key, 5000);
+            return (result, "");
         }
-        catch (Exception ex)
+        catch (SensorException ex)
         {
-            return "Error: " + ex.Message;
+            return ("", ex.Message);
         }
     }
 
-    private async void RefreshControlStates(DeviceState? st)
+    private async Task RefreshControlStates(DeviceState? st)
     {
         if (st == null)
             return;
         string mac = st.Mac;
-        string ntfResult = await SafeGetParam(st.Profile, "NTF");
-        string filterResult = await SafeGetParam(st.Profile, "FILTER");
-        string rateListResult = await SafeGetParam(st.Profile, "EEG_SAMPLE_RATE_LIST");
-        string rateResult = await SafeGetParam(st.Profile, "EEG_SAMPLE_RATE");
-        string emgListResult = await SafeGetParam(st.Profile, "EMG_SAMPLE_RATE_LIST");
-        string emgRateResult = await SafeGetParam(st.Profile, "EMG_SAMPLE_RATE");
-        string imuListResult = await SafeGetParam(st.Profile, "IMU_SAMPLE_RATE_LIST");
-        string imuRateResult = await SafeGetParam(st.Profile, "IMU_SAMPLE_RATE");
-        string ppgListResult = await SafeGetParam(st.Profile, "PPG_SAMPLE_RATE_LIST");
-        string ppgRateResult = await SafeGetParam(st.Profile, "PPG_SAMPLE_RATE");
+        (string ntfResult, string _) = await SafeGetParam(st.Profile, "NTF");
+        (string filterResult, string _) = await SafeGetParam(st.Profile, "FILTER");
+        (string rateListResult, string _) = await SafeGetParam(st.Profile, "EEG_SAMPLE_RATE_LIST");
+        (string rateResult, string _) = await SafeGetParam(st.Profile, "EEG_SAMPLE_RATE");
+        (string emgListResult, string _) = await SafeGetParam(st.Profile, "EMG_SAMPLE_RATE_LIST");
+        (string emgRateResult, string _) = await SafeGetParam(st.Profile, "EMG_SAMPLE_RATE");
+        (string imuListResult, string _) = await SafeGetParam(st.Profile, "IMU_SAMPLE_RATE_LIST");
+        (string imuRateResult, string _) = await SafeGetParam(st.Profile, "IMU_SAMPLE_RATE");
+        (string ppgListResult, string _) = await SafeGetParam(st.Profile, "PPG_SAMPLE_RATE_LIST");
+        (string ppgRateResult, string _) = await SafeGetParam(st.Profile, "PPG_SAMPLE_RATE");
         st = StateFor(mac);
         if (st == null)
             return;
@@ -1021,16 +1061,13 @@ public sealed partial class MainWindow : Window
     private static (List<int> options, int current) ParseRateState(string listResult, string rateResult)
     {
         var options = new List<int>();
-        if (!listResult.StartsWith("Error"))
+        foreach (string item in listResult.Split('|', StringSplitOptions.RemoveEmptyEntries))
         {
-            foreach (string item in listResult.Split('|', StringSplitOptions.RemoveEmptyEntries))
-            {
-                if (int.TryParse(item, out int rate))
-                    options.Add(rate);
-            }
+            if (int.TryParse(item, out int rate))
+                options.Add(rate);
         }
         int current = 0;
-        if (!rateResult.StartsWith("Error") && int.TryParse(rateResult, out int rc))
+        if (int.TryParse(rateResult, out int rc))
             current = rc;
         return (options, current);
     }
@@ -1047,7 +1084,7 @@ public sealed partial class MainWindow : Window
         int imuCh = st.HasInfo ? Math.Max(st.Info.AccChannelCount, st.Info.GyroChannelCount) : 0;
         int ppgCh = st.HasInfo ? st.Info.PpgChannelCount : 0;
         int spo2Ch = st.HasInfo ? st.Info.Spo2ChannelCount : 0;
-        int magCh = st.HasInfo ? st.Info.MagAngleChannelCount : 0;
+        int angleCh = st.HasInfo ? st.Info.AngleChannelCount : 0;
         var channelMap = new Dictionary<string, int>
         {
             ["NTF_EEG"] = eegCh,
@@ -1057,11 +1094,11 @@ public sealed partial class MainWindow : Window
             ["NTF_PPG"] = ppgCh,
             ["NTF_SPO2"] = spo2Ch,
             ["NTF_IMU"] = imuCh,
-            ["NTF_MAG_ANGLE"] = magCh,
+            ["NTF_ANGLE"] = angleCh,
         };
 
         var ntf = new Dictionary<string, (bool enabled, bool check)>();
-        if (!ntfResult.StartsWith("Error"))
+        if (ntfResult.Length > 0)
         {
             string[] items = ntfResult.Split('|');
             for (int i = 0; i + 1 < items.Length; i += 2)
@@ -1073,7 +1110,7 @@ public sealed partial class MainWindow : Window
         }
 
         var filters = new Dictionary<string, (bool enabled, bool check)>();
-        bool hasFilter = filterResult.Length > 0 && !filterResult.StartsWith("Error");
+        bool hasFilter = filterResult.Length > 0;
         var parsed = new Dictionary<string, string>();
         if (hasFilter)
         {
@@ -1169,7 +1206,36 @@ public sealed partial class MainWindow : Window
     // Debug log / bin data toggles
     // ------------------------------------------------------------------
 
-    private void ApplySdkDebugLog()
+    private async Task<(string result, string error)> SetControllerParam(string key, string value)
+    {
+        try
+        {
+            string result = await _ctrl.SetParamAsync(key, value);
+            AppLog($"App: setParam({key}, {value}) -> {result}");
+            return (result, "");
+        }
+        catch (SensorException ex)
+        {
+            AppLog($"App: setParam({key}, {value}) failed: {ex.Message}", "E");
+            System.Diagnostics.Debug.WriteLine($"[DemoWinUI3] setParam({key}) failed: {ex.Message}");
+            return ("", ex.Message);
+        }
+    }
+
+    private async Task<(string result, string error)> GetControllerParam(string key)
+    {
+        try
+        {
+            string result = await _ctrl.GetParamAsync(key);
+            return (result, "");
+        }
+        catch (SensorException ex)
+        {
+            return ("", ex.Message);
+        }
+    }
+
+    private async Task ApplySdkDebugLog()
     {
         string version = _ctrl.GetVersion().Replace('.', '_');
         string dir = Path.Combine(
@@ -1178,60 +1244,53 @@ public sealed partial class MainWindow : Window
             "Documents",
             "sensorsdklog",
             DateTime.Now.ToString("yyyyMMdd_HHmmss") + "_" + version);
-        _ = _ctrl.SetParamAsync("LOG_PATH", dir);
-        _ = _ctrl.SetParamAsync("DEBUG_ENABLED", "True");
+        await SetControllerParam("LOG_PATH", dir);
+        await SetControllerParam("DEBUG_ENABLED", "True");
         System.Diagnostics.Debug.WriteLine("[DemoWinUI3] LOG_PATH -> " + dir);
     }
 
-    private void OnDebugLogToggled(object sender, RoutedEventArgs e)
+    private async void OnDebugLogToggled(object sender, RoutedEventArgs e)
     {
         _debugLogEnabled = DebugLogBox.IsChecked == true;
         AppLog($"User: SDK debug log {(_debugLogEnabled ? "ON" : "OFF")}");
         if (_debugLogEnabled)
-            ApplySdkDebugLog();
+            await ApplySdkDebugLog();
         else
-            _ = _ctrl.SetParamAsync("DEBUG_ENABLED", "False");
+            await SetControllerParam("DEBUG_ENABLED", "False");
         string value = _debugLogEnabled ? "True" : "False";
-        foreach (DeviceState st in SnapshotStates())
-        {
-            if (!st.Profile.IsReady || !st.Profile.HasInited)
-                continue;
-            _ = PushDebugPathParam(st, "DEBUG_LOG_PATH", value);
-        }
+        await Task.WhenAll(SnapshotStates()
+            .Where(st => st.Profile.IsReady && st.Profile.HasInited)
+            .Select(st => PushDebugPathParam(st, "DEBUG_LOG_PATH", value)));
     }
 
-    private void OnBinDataToggled(object sender, RoutedEventArgs e)
+    private async void OnBinDataToggled(object sender, RoutedEventArgs e)
     {
         _binDataEnabled = BinDataBox.IsChecked == true;
         AppLog($"User: data debug log {(_binDataEnabled ? "ON" : "OFF")}");
         string value = _binDataEnabled ? "True" : "False";
-        foreach (DeviceState st in SnapshotStates())
-        {
-            if (!st.Profile.IsReady || !st.Profile.HasInited)
-                continue;
-            _ = PushDebugPathParam(st, "DEBUG_BLE_DATA_PATH", value);
-        }
+        await Task.WhenAll(SnapshotStates()
+            .Where(st => st.Profile.IsReady && st.Profile.HasInited)
+            .Select(st => PushDebugPathParam(st, "DEBUG_BLE_DATA_PATH", value)));
     }
 
-    private void ApplyDongleDebug()
+    private async Task ApplyDongleDebug()
     {
         string value = _dongleDebugEnabled ? "True" : "False";
-        _ = _ctrl.SetParamAsync("BLE_TRACE_ENABLED", value);
+        await SetControllerParam("BLE_TRACE_ENABLED", value);
     }
 
-    private void OnDongleDebugToggled(object sender, RoutedEventArgs e)
+    private async void OnDongleDebugToggled(object sender, RoutedEventArgs e)
     {
         _dongleDebugEnabled = DongleDebugBox.IsChecked == true;
         AppLog($"User: dongle debug {(_dongleDebugEnabled ? "ON" : "OFF")}");
-        ApplyDongleDebug();
+        await ApplyDongleDebug();
     }
 
     private async void OnTranslateImuToggled(object sender, RoutedEventArgs e)
     {
         string value = TranslateImuBox.IsChecked == true ? "True" : "False";
         AppLog($"User: translate IMU {value}");
-        string result = await _ctrl.SetParamAsync("TRANSLATE_IMU", value);
-        AppLog($"App: setParam(TRANSLATE_IMU, {value}) -> {result}");
+        await SetControllerParam("TRANSLATE_IMU", value);
     }
 
     private List<DeviceState> SnapshotStates()
@@ -1242,14 +1301,24 @@ public sealed partial class MainWindow : Window
 
     private async Task PushDebugPathParam(DeviceState st, string key, string value)
     {
-        (string msg, bool isError) = await SendSetParam(st.Profile, key, value);
-        st.Profile.Log($"App: setParam({key}, {value}) -> {msg}");
-        if (isError)
-            ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
+        (string msg, string error) = await SendSetParam(st.Profile, key, value);
+        msg = error.Length > 0 ? error : msg;
+        try
+        {
+            st.Profile.Log($"App: setParam({key}, {value}) -> {msg}");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[DemoWinUI3] log setParam({key}) failed: {ex.Message}");
+        }
+        if (error.Length > 0)
+            await ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
     }
 
-    private async Task ApplySessionParams(DeviceState st)
+    private async Task ApplySessionParams(DeviceState st, bool isAutoRecovery = false)
     {
+        if (AutoRecoveryCancelled(st, isAutoRecovery))
+            return;
         // One setParam at a time (the SDK serializes setParam per profile).
         if (_debugLogEnabled)
         {
@@ -1266,17 +1335,17 @@ public sealed partial class MainWindow : Window
     private async Task ApplySessionParam(DeviceState st, string key, string value,
                                          Dictionary<string, string> cache)
     {
-        (string _, bool isError) = await SendSetParam(st.Profile, key, value);
-        if (isError)
+        (string _, string error) = await SendSetParam(st.Profile, key, value);
+        if (error.Length > 0)
             return;
-        string cur = await SafeGetParam(st.Profile, key);
-        if (cur.Length > 0 && !cur.StartsWith("Error"))
+        (string cur, string _) = await SafeGetParam(st.Profile, key);
+        if (cur.Length > 0)
             cache[st.Mac] = cur;
     }
 
-    private void RecordSavedParam(string mac, string key, string value, string result)
+    private void RecordSavedParam(string mac, string key, string value)
     {
-        if (mac.Length == 0 || result.StartsWith("Error"))
+        if (mac.Length == 0)
             return;
         if (!_savedParamsByMac.TryGetValue(mac, out List<KeyValuePair<string, string>>? saved))
             _savedParamsByMac[mac] = saved = new List<KeyValuePair<string, string>>();
@@ -1291,26 +1360,29 @@ public sealed partial class MainWindow : Window
         saved.Add(new KeyValuePair<string, string>(key, value));
     }
 
-    private async Task RestoreSavedParams(DeviceState st)
+    private async Task RestoreSavedParams(DeviceState st, bool isAutoRecovery = false)
     {
+        if (AutoRecoveryCancelled(st, isAutoRecovery))
+            return;
         string mac = st.Mac;
         if (!_savedParamsByMac.TryGetValue(mac, out List<KeyValuePair<string, string>>? saved))
             return;
         foreach (KeyValuePair<string, string> kv in saved)
         {
-            (string msg, bool _) = await SendSetParam(st.Profile, kv.Key, kv.Value);
-            AppLog($"App: restore setParam({kv.Key}, {kv.Value}) -> {msg}", "I", StateFor(mac));
+            (string msg, string error) = await SendSetParam(st.Profile, kv.Key, kv.Value);
+            AppLog($"App: restore setParam({kv.Key}, {kv.Value}) -> {(error.Length > 0 ? error : msg)}", "I", StateFor(mac));
         }
-        RefreshControlStates(StateFor(mac));
+        await RefreshControlStates(StateFor(mac));
         ClearUiData();
     }
 
     private void OnAutoReconnectToggled(object sender, RoutedEventArgs e)
     {
         bool isChecked = AutoReconnectBox.IsChecked == true;
+        _autoReconnect = isChecked;
         AppLog($"User: auto reconnect {(isChecked ? "ON" : "OFF")}");
-        foreach (DeviceState st in SnapshotStates())
-            st.Profile.AutoReconnect = isChecked;
+        foreach (SensorProfile profile in _ctrl.GetSensors())
+            profile.AutoReconnect = isChecked;
     }
 
     // ------------------------------------------------------------------
@@ -1349,17 +1421,17 @@ public sealed partial class MainWindow : Window
         int typeIndex = Math.Max(0, TypeCombo.SelectedIndex);
         RingBuffer? buf;
         string[] labels;
-        double yLow, yHigh;
+        double? yLow = null, yHigh = null;
         switch (typeIndex)
         {
             case 0:
                 buf = st?.Acc;
-                labels = ["ACC-X", "ACC-Y", "ACC-Z"];
+                labels = ["ACC-X (g)", "ACC-Y (g)", "ACC-Z (g)"];
                 yLow = -8; yHigh = 8;
                 break;
             case 1:
                 buf = st?.Gyro;
-                labels = ["GYRO-X", "GYRO-Y", "GYRO-Z"];
+                labels = ["GYRO-X (dps)", "GYRO-Y (dps)", "GYRO-Z (dps)"];
                 yLow = -2000; yHigh = 2000;
                 break;
             case 2:
@@ -1367,10 +1439,14 @@ public sealed partial class MainWindow : Window
                 labels = ["W", "X", "Y", "Z"];
                 yLow = -1; yHigh = 1;
                 break;
-            default:
+            case 3:
                 buf = st?.Euler;
-                labels = ["Pitch(Y)", "Roll(X)", "Yaw(Z)"];
+                labels = ["Pitch(Y) (deg)", "Roll(X) (deg)", "Yaw(Z) (deg)"];
                 yLow = -180; yHigh = 180;
+                break;
+            default:
+                buf = st?.Mag;
+                labels = ["MAG-X (uT)", "MAG-Y (uT)", "MAG-Z (uT)"];
                 break;
         }
         if (st != null)
@@ -1384,9 +1460,12 @@ public sealed partial class MainWindow : Window
             Wave2d.SetPlaceholder("Not connected");
         }
         Wave2d.SetLabels(labels);
-        Wave2d.SetFixedYRange(yLow, yHigh);
+        if (yLow is double lo && yHigh is double hi)
+            Wave2d.SetFixedYRange(lo, hi);
+        else
+            Wave2d.SetAutoYRange();
 
-        Spectrum.SetLabels(labels);
+        Spectrum.SetLabels(labels.Select(label => label.Split(" (")[0]).ToArray());
         Spectrum.SetPlaceholder(Wave2d.HasSource ? "Waiting for data ..." : "Not connected");
         Spectrum.ClearResult();
 
@@ -1423,7 +1502,7 @@ public sealed partial class MainWindow : Window
             return 1;
         int extras = (st.Info.ECGChannelCount > 0 ? 1 : 0)
                    + (st.Info.BRTHChannelCount > 0 ? 1 : 0)
-                   + (st.Info.MagAngleChannelCount > 0 ? 1 : 0);
+                   + (st.Info.AngleChannelCount > 0 ? 1 : 0);
         int perPage = _bioWaves.Count - extras;
         int total = st.Info.EEGChannelCount > 0 ? st.Info.EEGChannelCount
                   : st.Eeg.Allocated ? st.Eeg.Channels : 0;
@@ -1468,7 +1547,7 @@ public sealed partial class MainWindow : Window
         {
             _bioFftRows[row] = new BioFftBinding(buf, channel);
             _bioSpectra[row].SetColorIndex(colorIndex);
-            _bioSpectra[row].SetLabels([label]);
+            _bioSpectra[row].SetLabels([label.Split(" (")[0]]);
             _bioSpectra[row].SetPlaceholder(string.Empty);
             _bioSpectra[row].Visibility = Visibility.Visible;
             _bioRows[row].ColumnDefinitions[0].Width = new GridLength(1, GridUnitType.Star);
@@ -1493,11 +1572,11 @@ public sealed partial class MainWindow : Window
 
         if (kind == DeviceState.BioKind.EMG && st != null)
         {
-            bool hasMag = st.Info.MagAngleChannelCount > 0 || st.MagAngle.Allocated;
-            int emgCh = st.Emg.Allocated ? Math.Min(st.Emg.Channels, _bioWaves.Count - (hasMag ? 1 : 0)) : 0;
-            int magIndex = emgCh;
-            BioTitleText.Text = hasMag && emgCh > 0 ? "EMG + Angle Waveform"
-                              : hasMag ? "Angle Waveform"
+            bool hasAngle = st.Info.AngleChannelCount > 0 || st.Angle.Allocated;
+            int emgCh = st.Emg.Allocated ? Math.Min(st.Emg.Channels, _bioWaves.Count - (hasAngle ? 1 : 0)) : 0;
+            int angleIndex = emgCh;
+            BioTitleText.Text = hasAngle && emgCh > 0 ? "EMG + Angle Waveform"
+                              : hasAngle ? "Angle Waveform"
                                        : "EMG Waveform";
             for (int i = 0; i < _bioWaves.Count; i++)
             {
@@ -1505,18 +1584,18 @@ public sealed partial class MainWindow : Window
                 {
                     _bioWaves[i].SetSource(st.Emg, st.BufMutex, i);
                     _bioWaves[i].SetAutoYRange();
-                    _bioWaves[i].SetLabels([$"EMG-{i + 1}"]);
+                    _bioWaves[i].SetLabels([$"EMG-{i + 1} (uV)"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.Emg, i, i, $"EMG-{i + 1}");
+                    SetBioSpectrum(i, st.Emg, i, i, $"EMG-{i + 1} (uV)");
                     _bioTargets[i] = (st.EmgImpedance, i);
                 }
-                else if (hasMag && i == magIndex && st.MagAngle.Allocated)
+                else if (hasAngle && i == angleIndex && st.Angle.Allocated)
                 {
-                    _bioWaves[i].SetSource(st.MagAngle, st.BufMutex, 0, i);
+                    _bioWaves[i].SetSource(st.Angle, st.BufMutex, 0, i);
                     _bioWaves[i].SetFixedYRange(0.0, 180.0);
-                    _bioWaves[i].SetLabels(["Angle"]);
+                    _bioWaves[i].SetLabels(["Angle (deg)"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.MagAngle, 0, i, "Angle");
+                    SetBioSpectrum(i, st.Angle, 0, i, "Angle (deg)");
                     _bioTargets[i] = (null, 0);
                 }
                 else
@@ -1535,10 +1614,10 @@ public sealed partial class MainWindow : Window
         {
             bool hasECG = st.Info.ECGChannelCount > 0 || st.Ecg.Allocated;
             bool hasBRTH = st.Info.BRTHChannelCount > 0 || st.Brth.Allocated;
-            bool hasMag = st.Info.MagAngleChannelCount > 0 || st.MagAngle.Allocated;
-            BioTitleText.Text = hasMag ? "EEG + ECG + BRTH + Angle Waveform"
+            bool hasAngle = st.Info.AngleChannelCount > 0 || st.Angle.Allocated;
+            BioTitleText.Text = hasAngle ? "EEG + ECG + BRTH + Angle Waveform"
                                        : "EEG + ECG + BRTH Waveform";
-            int perPage = _bioWaves.Count - (hasECG ? 1 : 0) - (hasBRTH ? 1 : 0) - (hasMag ? 1 : 0);
+            int perPage = _bioWaves.Count - (hasECG ? 1 : 0) - (hasBRTH ? 1 : 0) - (hasAngle ? 1 : 0);
             int total = st.Info.EEGChannelCount > 0 ? st.Info.EEGChannelCount
                       : st.Eeg.Allocated ? st.Eeg.Channels : 0;
             int pages = Math.Max(1, (total + perPage - 1) / perPage);
@@ -1546,7 +1625,7 @@ public sealed partial class MainWindow : Window
             int startCh = _bioPage * perPage;
             int ecgIndex = _bioWaves.Count - 1 - (hasBRTH ? 1 : 0);
             int brthIndex = _bioWaves.Count - 1;
-            int magIndex = ecgIndex - (hasECG ? 1 : 0);
+            int angleIndex = ecgIndex - (hasECG ? 1 : 0);
             for (int i = 0; i < _bioWaves.Count; i++)
             {
                 int eegCh = startCh + i;
@@ -1554,36 +1633,36 @@ public sealed partial class MainWindow : Window
                 {
                     _bioWaves[i].SetSource(st.Eeg, st.BufMutex, eegCh);
                     _bioWaves[i].SetAutoYRange();
-                    _bioWaves[i].SetLabels([$"EEG-{eegCh + 1}"]);
+                    _bioWaves[i].SetLabels([$"EEG-{eegCh + 1} (uV)"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.Eeg, eegCh, eegCh, $"EEG-{eegCh + 1}");
+                    SetBioSpectrum(i, st.Eeg, eegCh, eegCh, $"EEG-{eegCh + 1} (uV)");
                     _bioTargets[i] = (st.EegImpedance, eegCh);
                 }
                 else if (hasECG && i == ecgIndex && st.Ecg.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Ecg, st.BufMutex, 0);
                     _bioWaves[i].SetAutoYRange();
-                    _bioWaves[i].SetLabels(["ECG"]);
+                    _bioWaves[i].SetLabels(["ECG (uV)"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.Ecg, 0, 0, "ECG");
+                    SetBioSpectrum(i, st.Ecg, 0, 0, "ECG (uV)");
                     _bioTargets[i] = (st.EcgImpedance, 0);
                 }
                 else if (hasBRTH && i == brthIndex && st.Brth.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Brth, st.BufMutex, 0);
                     _bioWaves[i].SetAutoYRange();
-                    _bioWaves[i].SetLabels(["BRTH"]);
+                    _bioWaves[i].SetLabels(["BRTH (uV)"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
                     SetBioSpectrum(i, null, -1, -1, string.Empty);
                     _bioTargets[i] = (st.BrthImpedance, 0);
                 }
-                else if (hasMag && i == magIndex && st.MagAngle.Allocated)
+                else if (hasAngle && i == angleIndex && st.Angle.Allocated)
                 {
-                    _bioWaves[i].SetSource(st.MagAngle, st.BufMutex, 0, i);
+                    _bioWaves[i].SetSource(st.Angle, st.BufMutex, 0, i);
                     _bioWaves[i].SetFixedYRange(0.0, 180.0);
-                    _bioWaves[i].SetLabels(["Angle"]);
+                    _bioWaves[i].SetLabels(["Angle (deg)"]);
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.MagAngle, 0, i, "Angle");
+                    SetBioSpectrum(i, st.Angle, 0, i, "Angle (deg)");
                     _bioTargets[i] = (null, 0);
                 }
                 else
@@ -1604,12 +1683,12 @@ public sealed partial class MainWindow : Window
             BioTitleText.Text = "EEG + PPG + SpO2 Waveform";
             (RingBuffer buffer, int channel, string label, bool isEeg, bool hasFft)[] plotConfig =
             [
-                (st.Eeg, 0, "fp1", true, true),
-                (st.Eeg, 1, "fp2", true, true),
+                (st.Eeg, 0, "fp1 (uV)", true, true),
+                (st.Eeg, 1, "fp2 (uV)", true, true),
                 (st.Ppg, 0, "red_led", false, true),
                 (st.Ppg, 1, "ir_led", false, true),
-                (st.Spo2, 0, "spo2", false, false),
-                (st.Spo2, 1, "heart_rate", false, false),
+                (st.Spo2, 0, "spo2 (%)", false, false),
+                (st.Spo2, 1, "heart_rate (bpm)", false, false),
             ];
             for (int i = 0; i < _bioWaves.Count; i++)
             {
@@ -1674,7 +1753,8 @@ public sealed partial class MainWindow : Window
             0 => st.Acc,
             1 => st.Gyro,
             2 => st.Quat,
-            _ => st.Euler,
+            3 => st.Euler,
+            _ => st.Mag,
         };
         lock (st.BufMutex)
         {
@@ -1801,7 +1881,8 @@ public sealed partial class MainWindow : Window
             0 => st.Acc,
             1 => st.Gyro,
             2 => st.Quat,
-            _ => st.Euler,
+            3 => st.Euler,
+            _ => st.Mag,
         };
         List<float[]> snapshot;
         float rate;
@@ -1954,25 +2035,22 @@ public sealed partial class MainWindow : Window
     }
 
     // SDK backend label
-    private async void RefreshSdkLabel()
+    private async Task RefreshSdkLabel()
     {
         long now = Environment.TickCount64;
         if (_backendQueryPending || now - _backendQueryMs < 1000)
             return;
         _backendQueryPending = true;
         _backendQueryMs = now;
-        string backend;
-        try
+        (string backend, string error) = await GetControllerParam("BACK_END");
+        if (error.Length > 0)
         {
-            backend = await _ctrl.GetParamAsync("BACK_END");
-        }
-        catch (Exception)
-        {
+            System.Diagnostics.Debug.WriteLine("[DemoWinUI3] backend query failed: " + error);
             _backendQueryPending = false;
             return;
         }
         _backendQueryPending = false;
-        if (_shuttingDown || backend == _shownBackend || backend.StartsWith("Error"))
+        if (_shuttingDown || backend == _shownBackend)
             return;
         _shownBackend = backend;
         SdkLabel.Text = $"SDK: {_sdkVersion} | Backend: {_shownBackend}";
@@ -1998,7 +2076,7 @@ public sealed partial class MainWindow : Window
         MaybeSubmitBioFft(st);
 
         bool bioReady = st != null && ((st.GetBioKind() == DeviceState.BioKind.EMG
-                                        && (st.Emg.Allocated || st.MagAngle.Allocated))
+                                        && (st.Emg.Allocated || st.Angle.Allocated))
                                        || (st.GetBioKind() == DeviceState.BioKind.EEG && st.Eeg.Allocated)
                                        || (st.GetBioKind() == DeviceState.BioKind.PPG && st.Ppg.Allocated));
         if (bioReady && _bioWaves.Count > 0 && !_bioWaves[0].HasSource)
@@ -2025,7 +2103,7 @@ public sealed partial class MainWindow : Window
         ++_tickCount;
         if (_tickCount % (1000 / PlotUpdateIntervalMs) == 0)
         {
-            RefreshSdkLabel();
+            _ = RefreshSdkLabel();
             if (st != null)
             {
                 st.UpdateActualRates();
@@ -2220,7 +2298,7 @@ public sealed partial class MainWindow : Window
         try
         {
             string result = await _ctrl.CheckSetupDongleAsync();
-            ShowWarning("Check Dongle", result);
+            await ShowWarning("Check Dongle", result);
         }
         finally { CheckDongleButton.IsEnabled = true; }
     }

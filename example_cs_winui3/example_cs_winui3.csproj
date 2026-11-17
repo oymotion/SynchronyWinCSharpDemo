@@ -38,10 +38,14 @@
     <Compile Include="..\bindings\csharp\Sensor.cs" Link="Sensor.cs" />
   </ItemGroup>
 
-  <!-- Prebuilt SDK shared library; copied next to the exe after build -->
+  <!-- Prebuilt SDK shared library and frozen BLE helper; copied next to the exe after build -->
   <ItemGroup>
     <None Include="..\lib\windows\$(SensorSdkLibArch)\$(SensorSdkConfig)\$(SensorSdkDllName)">
       <Link>sensor.dll</Link>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Include="..\lib\windows\$(SensorSdkLibArch)\$(SensorSdkConfig)\sensor_ble_helper.exe">
+      <Link>sensor_ble_helper.exe</Link>
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
   </ItemGroup>
@@ -49,6 +53,8 @@
   <Target Name="CheckSensorSdkDll" BeforeTargets="ResolveReferences">
     <Error Condition="!Exists('$(MSBuildProjectDirectory)\..\lib\windows\$(SensorSdkLibArch)\$(SensorSdkConfig)\$(SensorSdkDllName)')"
            Text="$(SensorSdkDllName) not found: lib\windows\$(SensorSdkLibArch)\$(SensorSdkConfig)\$(SensorSdkDllName) -- build it first (python bld/windows/build_windows.py --release --archs x86,x64)" />
+    <Error Condition="!Exists('$(MSBuildProjectDirectory)\..\lib\windows\$(SensorSdkLibArch)\$(SensorSdkConfig)\sensor_ble_helper.exe')"
+           Text="sensor_ble_helper.exe not found: lib\windows\$(SensorSdkLibArch)\$(SensorSdkConfig)\sensor_ble_helper.exe -- build it first (python bld/windows/build_windows.py --release --archs x86,x64)" />
   </Target>
 
 </Project>

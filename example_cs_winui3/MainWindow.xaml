@@ -13,7 +13,7 @@
             <TextBlock Grid.Row="0" Text="3D Quaternion Visualization"/>
             <ctl:CubeControl Grid.Row="1" x:Name="Cube" Height="200"/>
 
-            <TextBlock Grid.Row="2" Text="2D Waveform + FFT Spectrum (ACC/GYRO/Quat/Euler)"/>
+            <TextBlock Grid.Row="2" Text="2D Waveform + FFT Spectrum (ACC/GYRO/Quat/Euler/MAG)"/>
             <ctl:WaveformControl Grid.Row="3" x:Name="Wave2d" MinHeight="120"/>
             <ctl:SpectrumControl Grid.Row="4" x:Name="Spectrum" MinHeight="48"/>
 
@@ -24,6 +24,7 @@
                     <x:String>Gyroscope (GYRO)</x:String>
                     <x:String>Quaternion (Quat)</x:String>
                     <x:String>Euler Angle (Euler)</x:String>
+                    <x:String>Magnetometer (MAG)</x:String>
                 </ComboBox>
                 <TextBlock Grid.Column="2" Text="Live Filter:" VerticalAlignment="Center" Margin="8,0,4,0"/>
                 <ComboBox Grid.Column="3" x:Name="FilterCombo" MinWidth="140" SelectionChanged="OnLiveFilterChanged"/>
@@ -129,7 +130,7 @@
                                       Click="OnDebugLogToggled"/>
                             <CheckBox x:Name="BinDataBox" Content="Enable Debug Bin Data" IsChecked="True"
                                       Click="OnBinDataToggled"/>
-                            <CheckBox x:Name="DongleDebugBox" Content="Enable debug dongle" IsChecked="True"
+                            <CheckBox x:Name="DongleDebugBox" Content="Enable debug dongle" IsChecked="False"
                                       Click="OnDongleDebugToggled"/>
                             <CheckBox x:Name="TranslateImuBox" Content="Translate IMU (split ACC/GYRO/EULER/QUAT)"
                                       IsChecked="True" Click="OnTranslateImuToggled"/>

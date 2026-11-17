@@ -1,6 +1,6 @@
 @echo off
 REM Export the WinUI3 demo as a standalone project: demo sources + C# bindings
-REM + Release sensor.dll (x64 + x86), keeping the repo-relative layout so the
+REM + Release sensor.dll and sensor_ble_helper.exe (x64 + x86), keeping the repo-relative layout so the
 REM csproj works unmodified. Usage: export_standalone.bat [target_dir]
 setlocal
 set TARGET=%~1
@@ -11,9 +11,9 @@ robocopy "%~dp0." "%TARGET%\example_cs_winui3" /MIR /XD bin obj .vs /XF *.user /
 if errorlevel 8 goto :fail
 robocopy "%ROOT%\bindings\csharp" "%TARGET%\bindings\csharp" SensorCapi.cs Sensor.cs README.md /NFL /NDL /NJH
 if errorlevel 8 goto :fail
-robocopy "%ROOT%\lib\windows\x64\Release" "%TARGET%\lib\windows\x64\Release" sensor.dll /NFL /NDL /NJH
+robocopy "%ROOT%\lib\windows\x64\Release" "%TARGET%\lib\windows\x64\Release" sensor.dll sensor_ble_helper.exe /NFL /NDL /NJH
 if errorlevel 8 goto :fail
-robocopy "%ROOT%\lib\windows\Win32\Release" "%TARGET%\lib\windows\Win32\Release" sensor32.dll /NFL /NDL /NJH
+robocopy "%ROOT%\lib\windows\Win32\Release" "%TARGET%\lib\windows\Win32\Release" sensor32.dll sensor_ble_helper.exe /NFL /NDL /NJH
 if errorlevel 8 goto :fail
 
 REM the export ships Release dlls only; make Release the default there
